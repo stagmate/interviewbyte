@@ -185,9 +185,7 @@ export default function PracticePage() {
             console.log('Credit consumed, remaining:', remainingCredits);
         },
         onNoCredits: () => {
-            setError('No interview credits available. Please purchase more credits.');
-            stopRecording();
-            router.push('/pricing');
+            console.log('No credits available. Allowing anyway for free version.');
         },
     });
 
@@ -247,25 +245,21 @@ export default function PracticePage() {
     useEffect(() => {
         const checkAuth = async () => {
             const { data: { session } } = await supabase.auth.getSession();
-            if (!session) {
-                router.push('/auth/login');
-                return;
+            if (session?.user?.id) {
+                setUserId(session.user.id);
             }
-            setUserId(session.user.id);
         };
         checkAuth();
 
         // Listen for auth changes
         const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-            if (!session) {
-                router.push('/auth/login');
-            } else {
+            if (session?.user?.id) {
                 setUserId(session.user.id);
             }
         });
 
         return () => subscription.unsubscribe();
-    }, [router]);
+    }, []);
 
     // Fetch user context (STAR stories and Q&A pairs) when userId and profile are available
     useEffect(() => {
@@ -356,11 +350,11 @@ export default function PracticePage() {
             return;
         }
 
-        // Redirect to pricing if no credits
-        if (!hasCredits) {
-            router.push('/pricing');
-            return;
-        }
+        // Unlimited Access Mod: Bypass hasCredits check
+        // if (!hasCredits) {
+        //     router.push('/pricing');
+        //     return;
+        // }
 
         // Wait for backend auth (context_ack) before consuming credits
         if (!isAuthenticated) {
@@ -576,7 +570,6 @@ export default function PracticePage() {
                             streamingQuestion={streamingQuestion}
                             onRegenerate={handleRegenerate}
                             onStopGenerating={handleStopGenerating}
-                            aiGeneratorAvailable={ai_generator_available}
                         />
                         {answers.length > 0 && (
                             <div className="mt-3 flex items-center gap-2">

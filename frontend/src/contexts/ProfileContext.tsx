@@ -101,7 +101,20 @@ export function ProfileProvider({ children }: ProfileProviderProps) {
                 setUserId(session.user.id);
                 await loadProfiles(session.user.id);
             } else {
-                setIsLoading(false);
+                // Perform anonymous login automatically
+                try {
+                    const { data, error } = await supabase.auth.signInAnonymously();
+                    if (error) {
+                        console.error("Anonymous Sign-In Error:", error);
+                        setIsLoading(false);
+                    } else if (data?.user?.id) {
+                        setUserId(data.user.id);
+                        await loadProfiles(data.user.id);
+                    }
+                } catch (e) {
+                    console.error("Failed anonymous sign-in", e);
+                    setIsLoading(false);
+                }
             }
         };
 

@@ -49,24 +49,20 @@ export default function InterviewSettingsPage() {
     useEffect(() => {
         const checkAuth = async () => {
             const { data: { session } } = await supabase.auth.getSession();
-            if (!session) {
-                router.push('/auth/login');
-                return;
+            if (session?.user?.id) {
+                setUserId(session.user.id);
             }
-            setUserId(session.user.id);
         };
         checkAuth();
 
         const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-            if (!session) {
-                router.push('/auth/login');
-            } else {
+            if (session?.user?.id) {
                 setUserId(session.user.id);
             }
         });
 
         return () => subscription.unsubscribe();
-    }, [router]);
+    }, []);
 
     // Sync form data with active profile
     useEffect(() => {

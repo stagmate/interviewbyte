@@ -3,7 +3,6 @@
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
-import { useUserFeatures } from '@/hooks/useUserFeatures';
 import { useProfile } from '@/contexts/ProfileContext';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
@@ -38,10 +37,6 @@ export default function ContextUploadPage() {
   // Profile context
   const { activeProfile, isLoading: profileLoading } = useProfile();
 
-  // Feature gating - check ai_generator access
-  const { ai_generator_available, isLoading: featuresLoading } = useUserFeatures(userId);
-  const canGenerate = ai_generator_available;
-
   const [currentStep, setCurrentStep] = useState<UploadStep>('resume');
 
   // Upload states
@@ -70,22 +65,17 @@ export default function ContextUploadPage() {
     const checkAuth = async () => {
       const { data: { session } } = await supabase.auth.getSession();
 
-      if (!session) {
-        router.push('/auth/login');
-        return;
+      if (session?.user?.id) {
+        setUserId(session.user.id);
       }
-
-      setUserId(session.user.id);
     };
 
     checkAuth();
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       (_event, session) => {
-        if (session) {
+        if (session?.user?.id) {
           setUserId(session.user.id);
-        } else {
-          router.push('/auth/login');
         }
       }
     );
@@ -93,7 +83,7 @@ export default function ContextUploadPage() {
     return () => {
       subscription.unsubscribe();
     };
-  }, [router]);
+  }, []);
 
   // Load contexts when user or profile changes
   useEffect(() => {
@@ -791,7 +781,6 @@ export default function ContextUploadPage() {
               <div className="flex gap-2">
                 <button
                   onClick={() => {
-                    if (!canGenerate) { router.push('/pricing'); return; }
                     handleGenerateQA();
                   }}
                   disabled={!hasResume || isGenerating}

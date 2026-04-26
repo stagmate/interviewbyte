@@ -8,7 +8,6 @@
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
-import { useUserFeatures } from '@/hooks/useUserFeatures';
 import { useProfile } from '@/contexts/ProfileContext';
 
 interface QAPair {
@@ -42,10 +41,6 @@ export default function QAPairsPage() {
     // Profile context
     const { activeProfile, isLoading: profileLoading } = useProfile();
 
-    // Feature gating - check qa_management access
-    const { qa_management_available, isLoading: featuresLoading } = useUserFeatures(userId);
-    const canEdit = qa_management_available;
-
     const [qaPairs, setQaPairs] = useState<QAPair[]>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
@@ -74,25 +69,21 @@ export default function QAPairsPage() {
     useEffect(() => {
         const checkAuth = async () => {
             const { data: { session } } = await supabase.auth.getSession();
-            if (!session) {
-                router.push('/auth/login');
-                return;
+            if (session?.user?.id) {
+                setUserId(session.user.id);
             }
-            setUserId(session.user.id);
         };
         checkAuth();
 
         // Listen for auth changes
         const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-            if (!session) {
-                router.push('/auth/login');
-            } else {
+            if (session?.user?.id) {
                 setUserId(session.user.id);
             }
         });
 
         return () => subscription.unsubscribe();
-    }, [router]);
+    }, []);
 
     // Fetch Q&A pairs when userId or activeProfile changes
     useEffect(() => {
@@ -376,7 +367,6 @@ export default function QAPairsPage() {
                                 {qaPairs.length > 0 && (
                                     <button
                                         onClick={() => {
-                                            if (!canEdit) { router.push('/pricing'); return; }
                                             handleDeleteAll();
                                         }}
                                         className="rounded-lg border border-red-300 px-4 py-2 text-sm font-medium text-red-600 hover:bg-red-50 dark:border-red-700 dark:text-red-400 dark:hover:bg-red-950"
@@ -386,7 +376,6 @@ export default function QAPairsPage() {
                                 )}
                                 <button
                                     onClick={() => {
-                                        if (!canEdit) { router.push('/pricing'); return; }
                                         setShowBulkUpload(true);
                                         setIsCreating(false);
                                     }}
@@ -396,7 +385,6 @@ export default function QAPairsPage() {
                                 </button>
                                 <button
                                     onClick={() => {
-                                        if (!canEdit) { router.push('/pricing'); return; }
                                         setIsCreating(true);
                                         setShowBulkUpload(false);
                                     }}
@@ -667,7 +655,6 @@ A: I excel at problem-solving and teamwork...`}
                                     <div className="flex gap-2">
                                         <button
                                             onClick={() => {
-                                                if (!canEdit) { router.push('/pricing'); return; }
                                                 handleEdit(pair);
                                             }}
                                             className="text-sm text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
@@ -676,7 +663,6 @@ A: I excel at problem-solving and teamwork...`}
                                         </button>
                                         <button
                                             onClick={() => {
-                                                if (!canEdit) { router.push('/pricing'); return; }
                                                 handleDelete(pair.id);
                                             }}
                                             className="text-sm text-red-500 hover:text-red-700"

@@ -6,7 +6,6 @@
  */
 
 import React, { useState } from 'react';
-import Link from 'next/link';
 
 interface Answer {
     question: string;
@@ -27,7 +26,6 @@ interface AnswerDisplayProps {
     onRegenerate?: (question: string) => void;
     onRateAnswer?: (question: string, rating: 'up' | 'down') => void;
     onStopGenerating?: () => void;
-    aiGeneratorAvailable?: boolean;
 }
 
 // Helper function to highlight placeholder text [like this] with purple-pink color
@@ -110,7 +108,7 @@ const XIcon = ({ className }: { className?: string }) => (
     </svg>
 );
 
-export function AnswerDisplay({ answers, isGenerating, temporaryAnswer, streamingAnswer, streamingQuestion, onRegenerate, onRateAnswer, onStopGenerating, aiGeneratorAvailable }: AnswerDisplayProps) {
+export function AnswerDisplay({ answers, isGenerating, temporaryAnswer, streamingAnswer, streamingQuestion, onRegenerate, onRateAnswer, onStopGenerating }: AnswerDisplayProps) {
     const [expandedAnswers, setExpandedAnswers] = useState<Set<number>>(new Set());
     const [copiedAnswer, setCopiedAnswer] = useState<number | null>(null);
     const [ratedAnswers, setRatedAnswers] = useState<Map<string, 'up' | 'down'>>(new Map());
@@ -351,21 +349,6 @@ export function AnswerDisplay({ answers, isGenerating, temporaryAnswer, streamin
                                     </button>
                                 )}
                             </div>
-
-                            {/* Show tip for placeholder answers if AI Generator not purchased */}
-                            {answer.hasPlaceholder && !aiGeneratorAvailable && (
-                                <div className="mt-3 rounded-lg bg-blue-50 border border-blue-200 p-3 dark:bg-blue-950 dark:border-blue-800">
-                                    <p className="text-sm text-blue-700 dark:text-blue-300">
-                                        💡 Want personalized answers?{' '}
-                                        <Link
-                                            href="/pricing"
-                                            className="font-medium underline hover:text-blue-800 dark:hover:text-blue-200"
-                                        >
-                                            Try our AI Q&A Generator!
-                                        </Link>
-                                    </p>
-                                </div>
-                            )}
 
                             {onRateAnswer && (
                                 <div className="mt-3 flex items-center gap-2">
