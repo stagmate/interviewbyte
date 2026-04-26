@@ -2,10 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import { supabase } from '@/lib/supabase';
-import { useAudioRecorder } from '@/hooks/useAudioRecorder';
-import { useWebSocket } from '@/hooks/useWebSocket';
-import { useUserFeatures } from '@/hooks/useUserFeatures';
+import { useSpeechRecognition } from '@/hooks/useSpeechRecognition';
 import { useProfile } from '@/contexts/ProfileContext';
 import { AudioLevelIndicator } from '@/components/interview/AudioLevelIndicator';
 import { TranscriptionDisplay } from '@/components/interview/TranscriptionDisplay';
@@ -39,24 +36,17 @@ interface QAPair {
     usage_count: number;
 }
 
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/ws/transcribe';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 export default function PracticePage() {
     const router = useRouter();
-    const [userId, setUserId] = useState<string | null>(null);
 
-    // Profile context
+    // Context from active profile (if user has one, otherwise works without it)
     const { activeProfile, isLoading: profileLoading } = useProfile();
-
-    // Feature gating - check interview credits and AI generator
-    const { interview_credits, ai_generator_available, isLoading: featuresLoading } = useUserFeatures(userId);
-    const hasCredits = interview_credits > 0;
 
     const [currentText, setCurrentText] = useState('');
     const [accumulatedText, setAccumulatedText] = useState('');
     const [answers, setAnswers] = useState<Answer[]>([]);
-    const [temporaryAnswer, setTemporaryAnswer] = useState<string | null>(null);
     const [streamingAnswer, setStreamingAnswer] = useState<string>('');
     const [streamingQuestion, setStreamingQuestion] = useState<string>('');
     const [isGenerating, setIsGenerating] = useState(false);
@@ -64,400 +54,175 @@ export default function PracticePage() {
     const [error, setError] = useState<string | null>(null);
     const [starStories, setStarStories] = useState<StarStory[]>([]);
     const [qaPairs, setQaPairs] = useState<QAPair[]>([]);
-    const [contextLoaded, setContextLoaded] = useState(false);
-    const [processingState, setProcessingState] = useState<'idle' | 'transcribing' | 'detecting' | 'generating'>('idle');
-    const [captureSystemAudio, setCaptureSystemAudio] = useState(false);
-    const [systemAudioError, setSystemAudioError] = useState<string | null>(null);
+    const [processingState, setProcessingState] = useState<'idle' | 'generating'>('idle');
     const [feedbackGiven, setFeedbackGiven] = useState<1 | -1 | null>(null);
 
-    // Refs to track streaming state (avoids closure issues)
-    const streamingAnswerRef = useRef<string>('');
-    const streamingQuestionRef = useRef<string>('');
-    const streamingSourceRef = useRef<string>('generated');
-
-    // WebSocket connection
-    const {
-        isConnected,
-        isAuthenticated,
-        connect,
-        disconnect,
-        sendAudio,
-        sendContext,
-        requestAnswer,
-        clearSession,
-        finalizeAudio,
-        notifyStartRecording,
-        sendFeedback,
-    } = useWebSocket({
-        url: WS_URL,
-        onTranscription: (text, accumulated) => {
-            setCurrentText(text);
-            setAccumulatedText(accumulated);
-            setProcessingState('idle');
-        },
-        onQuestionDetected: (question, type) => {
-            // Just detection, do not auto-generate
-            // setIsGenerating(true);
-            // setProcessingState('generating');
-            console.log('Question detected:', question);
-        },
-        onTemporaryAnswer: (question, answer) => {
-            setTemporaryAnswer(answer);
-            setIsGenerating(true);
-            setProcessingState('generating');
-            setAccumulatedText('');  // Clear when answer generation starts
-        },
-        onAnswer: (question, answer, source) => {
-            setAnswers(prev => [{
-                question,
-                answer,
-                timestamp: new Date(),
-                source,
-            }, ...prev]);
-            setTemporaryAnswer(null);
-            streamingAnswerRef.current = '';
-            streamingQuestionRef.current = '';
-            setStreamingAnswer('');
-            setStreamingQuestion('');
-            setIsGenerating(false);
-            setProcessingState('idle');
-            setAccumulatedText('');
-        },
-        onAnswerStreamStart: (question, source) => {
-            console.log('Streaming answer started for:', question, 'source:', source);
-            streamingQuestionRef.current = question;
-            streamingAnswerRef.current = '';
-            streamingSourceRef.current = source || 'generated';
-            setStreamingQuestion(question);
-            setStreamingAnswer('');
-            setTemporaryAnswer(null);
-            setIsGenerating(true);
-            setProcessingState('generating');
-            setAccumulatedText('');  // Clear immediately when answer generation starts
-        },
-        onAnswerStreamChunk: (chunk) => {
-            streamingAnswerRef.current += chunk;
-            setStreamingAnswer(prev => prev + chunk);
-        },
-        onAnswerStreamEnd: (question, hasPlaceholder, source) => {
-            console.log('Streaming answer completed for:', question, 'source:', source);
-            // Move streaming answer to final answers using ref (avoids closure issue)
-            const finalAnswer = streamingAnswerRef.current;
-            const finalQuestion = streamingQuestionRef.current || question;
-            const finalSource = source || streamingSourceRef.current || 'generated';
-
-            if (finalAnswer.trim()) {
-                setAnswers(prev => [{
-                    question: finalQuestion,
-                    answer: finalAnswer,
-                    timestamp: new Date(),
-                    source: finalSource,
-                    hasPlaceholder: hasPlaceholder || false,
-                }, ...prev]);
-            } else {
-                console.warn('Streaming ended but answer is empty');
-            }
-
-            // Clear refs and state
-            streamingAnswerRef.current = '';
-            streamingQuestionRef.current = '';
-            streamingSourceRef.current = 'generated';
-            setStreamingAnswer('');
-            setStreamingQuestion('');
-            setIsGenerating(false);
-            setProcessingState('idle');
-            setAccumulatedText('');
-        },
-        onError: (message) => {
-            setError(message);
-            setTemporaryAnswer(null);
-            streamingAnswerRef.current = '';
-            streamingQuestionRef.current = '';
-            streamingSourceRef.current = 'generated';
-            setStreamingAnswer('');
-            setStreamingQuestion('');
-            setIsGenerating(false);
-        },
-        onConnectionChange: (connected) => {
-            console.log('Connection status:', connected);
-        },
-        onCreditConsumed: (remainingCredits) => {
-            console.log('Credit consumed, remaining:', remainingCredits);
-        },
-        onNoCredits: () => {
-            console.log('No credits available. Allowing anyway for free version.');
-        },
-    });
-
-    // System audio handlers
-    const handleCaptureSystemAudioChange = useCallback((enabled: boolean) => {
-        setCaptureSystemAudio(enabled);
-        localStorage.setItem('captureSystemAudio', String(enabled));
-    }, []);
-
-    const handleSystemAudioError = useCallback((error: string) => {
-        setSystemAudioError(error);
-        setTimeout(() => setSystemAudioError(null), 5000);
-    }, []);
-
-    const handleSystemAudioStopped = useCallback(() => {
-        setSystemAudioError('System audio sharing stopped. Continuing with microphone only.');
-        setTimeout(() => setSystemAudioError(null), 5000);
-    }, []);
-
-    // Handle silence detection
-    const handleSilenceDetected = useCallback(() => {
-        console.log('Silence detected in practice page, finalizing audio');
-        finalizeAudio();
-    }, [finalizeAudio]);
-
-    // Audio recorder
-    const {
-        isRecording,
-        isPaused,
-        audioLevel,
-        error: recordingError,
-        isCapturingSystemAudio,
-        startRecording,
-        stopRecording,
-        pauseRecording,
-        resumeRecording,
-    } = useAudioRecorder({
-        onAudioData: sendAudio,
-        onSilenceDetected: handleSilenceDetected,
-        chunkInterval: 1000,
-        sampleRate: 16000,
-        silenceThreshold: 5,
-        silenceDuration: 800,
-        captureSystemAudio,
-        onSystemAudioError: handleSystemAudioError,
-        onSystemAudioStopped: handleSystemAudioStopped,
-    });
-
-    // Restore localStorage preferences on mount (client-only to avoid hydration mismatch)
+    // Fetch user context if profile exists
     useEffect(() => {
-        if (localStorage.getItem('captureSystemAudio') === 'true') {
-            setCaptureSystemAudio(true);
-        }
-    }, []);
-
-    // Check authentication on mount
-    useEffect(() => {
-        const checkAuth = async () => {
-            const { data: { session } } = await supabase.auth.getSession();
-            if (session?.user?.id) {
-                setUserId(session.user.id);
-            }
-        };
-        checkAuth();
-
-        // Listen for auth changes
-        const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-            if (session?.user?.id) {
-                setUserId(session.user.id);
-            }
-        });
-
-        return () => subscription.unsubscribe();
-    }, []);
-
-    // Fetch user context (STAR stories and Q&A pairs) when userId and profile are available
-    useEffect(() => {
-        if (!userId || !activeProfile) return;
+        if (!activeProfile) return;
 
         const fetchAll = async () => {
             try {
-                // Build URLs with profile_id
-                const contextUrl = new URL(`${API_URL}/api/profile/context/${userId}`);
+                // Fetch Q&A pairs (assuming user is anonymous, skip complex backend auth)
+                // However, without backend we just leave it empty if API fails
+                if (!activeProfile.user_id) return;
+                
+                const contextUrl = new URL(`${API_URL}/api/profile/context/${activeProfile.user_id}`);
                 contextUrl.searchParams.set('profile_id', activeProfile.id);
 
-                const qaPairsUrl = new URL(`${API_URL}/api/qa-pairs/${userId}`);
+                const qaPairsUrl = new URL(`${API_URL}/api/qa-pairs/${activeProfile.user_id}`);
                 qaPairsUrl.searchParams.set('profile_id', activeProfile.id);
 
-                // Fetch both context and Q&A pairs in parallel
                 const [contextResponse, qaPairsResponse] = await Promise.all([
-                    fetch(contextUrl.toString()),
-                    fetch(qaPairsUrl.toString())
+                    fetch(contextUrl.toString()).catch(() => null),
+                    fetch(qaPairsUrl.toString()).catch(() => null)
                 ]);
 
-                if (contextResponse.ok) {
+                if (contextResponse?.ok) {
                     const contextData = await contextResponse.json();
                     setStarStories(contextData.star_stories || []);
                 }
 
-                if (qaPairsResponse.ok) {
+                if (qaPairsResponse?.ok) {
                     const qaPairsData = await qaPairsResponse.json();
                     setQaPairs(qaPairsData || []);
-                    console.log(`Loaded ${qaPairsData?.length || 0} Q&A pairs for profile ${activeProfile.profile_name}`);
                 }
-
-                // Set contextLoaded only after BOTH are loaded
-                setContextLoaded(true);
             } catch (err) {
                 console.error('Failed to fetch user context:', err);
             }
         };
 
         fetchAll();
-    }, [userId, activeProfile]);
+    }, [activeProfile]);
 
-    // Send context when connected (with JWT auth)
-    useEffect(() => {
-        if (isConnected && contextLoaded && userId && activeProfile) {
-            const sendAuthenticatedContext = async () => {
-                const { data: { session } } = await supabase.auth.getSession();
-                sendContext({
-                    user_id: userId,
-                    profile_id: activeProfile.id,
-                    access_token: session?.access_token,
-                    resume_text: '',
-                    star_stories: starStories,
-                    talking_points: [],
-                    qa_pairs: qaPairs
-                });
-            };
-            sendAuthenticatedContext();
+    const requestAnswer = useCallback(async (questionText: string) => {
+        if (!questionText.trim()) return;
+
+        setIsGenerating(true);
+        setProcessingState('generating');
+        setStreamingQuestion(questionText);
+        setStreamingAnswer('');
+
+        try {
+            const contextData: string[] = [];
+            if (activeProfile?.projects_summary) contextData.push(`Projects: ${activeProfile.projects_summary}`);
+            if (starStories.length > 0) contextData.push(`Stories: ${JSON.stringify(starStories.map(s => ({ title: s.title, situation: s.situation, action: s.action })))}`);
+            if (qaPairs.length > 0) contextData.push(`Prepared Q&A: ${JSON.stringify(qaPairs.map(q => ({ q: q.question, a: q.answer })))}`);
+
+            const response = await fetch('/api/generate-answer', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    question: questionText,
+                    contexts: contextData
+                })
+            });
+
+            if (!response.ok) {
+                throw new Error('Failed to reach Gemini API.');
+            }
+
+            if (!response.body) throw new Error('No response body');
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let fullAnswer = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                
+                const chunk = decoder.decode(value, { stream: true });
+                fullAnswer += chunk;
+                setStreamingAnswer(prev => prev + chunk);
+            }
+
+            // Finalize Answer
+            setAnswers(prev => [{
+                question: questionText,
+                answer: fullAnswer,
+                timestamp: new Date(),
+                source: 'gemini',
+                hasPlaceholder: false
+            }, ...prev]);
+
+        } catch (err: any) {
+            setError(err.message || 'Failed to generate answer.');
+        } finally {
+            setIsGenerating(false);
+            setProcessingState('idle');
+            setStreamingAnswer('');
+            setStreamingQuestion('');
         }
-    }, [isConnected, contextLoaded, userId, activeProfile, starStories, qaPairs, sendContext]);
+    }, [activeProfile, starStories, qaPairs]);
+
+    // Handle Native Speech Recognition
+    const handleTranscription = useCallback((text: string, accumulated: string) => {
+        setCurrentText(text);
+        setAccumulatedText(accumulated);
+    }, []);
+
+    const handleSilenceDetected = useCallback((finalText: string) => {
+        console.log('Silence detected, finalizing text:', finalText);
+        // Automatically ask AI!
+        if (finalText.trim()) {
+            requestAnswer(finalText);
+        }
+    }, [requestAnswer]);
+
+    const {
+        isRecording,
+        isPaused,
+        error: recordingError,
+        startRecording,
+        stopRecording,
+        pauseRecording,
+        resumeRecording,
+    } = useSpeechRecognition({
+        onTranscription: handleTranscription,
+        onSilenceDetected: handleSilenceDetected,
+        silenceThresholdMs: 1500
+    });
 
     // Session timer
     useEffect(() => {
         let interval: NodeJS.Timeout | null = null;
-
-        if (isRecording) {
+        if (isRecording && !isPaused) {
             interval = setInterval(() => {
                 setSessionTime(prev => prev + 1);
             }, 1000);
         }
-
         return () => {
             if (interval) clearInterval(interval);
         };
-    }, [isRecording]);
+    }, [isRecording, isPaused]);
 
-    // Format time
     const formatTime = (seconds: number) => {
         const mins = Math.floor(seconds / 60);
         const secs = seconds % 60;
         return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
     };
 
-    // Handle start
-    const handleStart = async () => {
-        // Wait for features to load before checking credits
-        if (featuresLoading) {
-            console.log('Still loading user features, please wait...');
-            return;
-        }
-
-        // Unlimited Access Mod: Bypass hasCredits check
-        // if (!hasCredits) {
-        //     router.push('/pricing');
-        //     return;
-        // }
-
-        // Wait for backend auth (context_ack) before consuming credits
-        if (!isAuthenticated) {
-            console.log('Waiting for backend authentication...');
-            setError('Connecting to server, please try again in a moment.');
-            return;
-        }
-
-        setError(null);
-        await startRecording();
-        // Notify backend to consume credit when recording actually starts
-        notifyStartRecording();
-    };
-
-    // Handle stop
-    const handleStop = () => {
+    const handleClear = () => {
         stopRecording();
-    };
-
-    // Handle clear
-    // Handle clear
-    const handleClear = async () => {
-        const wasRecording = isRecording;
-
-        // 1. Stop recording first to flush final data
-        if (wasRecording) {
-            stopRecording();
-            // Wait for data to flush
-            await new Promise(resolve => setTimeout(resolve, 200));
-        }
-
-        // 2. Clear backend session (safe now, no more chunks from old stream)
-        clearSession();
-
-        // 3. Reset local state
         setCurrentText('');
         setAccumulatedText('');
         setAnswers([]);
         setSessionTime(0);
         setError(null);
-
-        // 4. Restart recording if it was active
-        if (wasRecording) {
-            // Small buffer before starting new
-            await new Promise(resolve => setTimeout(resolve, 100));
-            await startRecording();
-        }
     };
 
-    // Handle regenerate
-    const handleRegenerate = useCallback((question: string) => {
-        // Clear previous answer immediately for fast UI response
-        setTemporaryAnswer(null);
-        setStreamingAnswer('');
-        setStreamingQuestion('');
-        streamingAnswerRef.current = '';
-        streamingQuestionRef.current = '';
-
-        // Start new generation
-        setIsGenerating(true);
-        setProcessingState('generating');
-        requestAnswer(question);
-    }, [requestAnswer]);
-
-    // Handle stop generating
-    const handleStopGenerating = useCallback(() => {
-        setIsGenerating(false);
-        console.log('Answer generation stopped by user');
-    }, []);
-
-    // Handle manual answer generation
     const handleManualGenerate = useCallback(() => {
         if (accumulatedText.trim()) {
-            console.log('Manually requesting answer for:', accumulatedText);
-            setIsGenerating(true);
-            setProcessingState('generating');
             requestAnswer(accumulatedText);
+            setAccumulatedText('');
+            setCurrentText('');
         }
     }, [accumulatedText, requestAnswer]);
 
-    // Show message if no profile is selected
-    if (!profileLoading && !activeProfile) {
-        return (
-            <div className="min-h-screen bg-zinc-50 dark:bg-black">
-                <div className="mx-auto max-w-4xl px-4 py-6">
-                    <div className="rounded-lg border border-amber-200 bg-amber-50 p-6 dark:border-amber-800 dark:bg-amber-950">
-                        <h2 className="text-lg font-semibold text-amber-900 dark:text-amber-100">
-                            No Profile Selected
-                        </h2>
-                        <p className="mt-2 text-amber-700 dark:text-amber-300">
-                            Please create or select a profile before starting an interview practice session.
-                        </p>
-                        <button
-                            onClick={() => router.push('/profile/manage')}
-                            className="mt-4 rounded-lg bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700"
-                        >
-                            Manage Profiles
-                        </button>
-                    </div>
-                </div>
-            </div>
-        );
-    }
+    const handleRegenerate = useCallback((question: string) => {
+        requestAnswer(question);
+    }, [requestAnswer]);
 
     return (
         <div className="min-h-screen bg-zinc-50 dark:bg-black">
@@ -465,7 +230,6 @@ export default function PracticePage() {
             <header className="border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
                 <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-4">
                     <div>
-                        {/* Profile Indicator */}
                         {activeProfile && (
                             <div className="mb-1 flex items-center gap-2">
                                 <div className="flex h-5 w-5 items-center justify-center rounded-full bg-gradient-to-br from-blue-500 to-purple-600 text-xs font-bold text-white">
@@ -477,7 +241,7 @@ export default function PracticePage() {
                             </div>
                         )}
                         <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">
-                            Interview Practice
+                            Interview Practice (Native Speech)
                         </h1>
                     </div>
                     <div className="flex items-center gap-4">
@@ -485,54 +249,34 @@ export default function PracticePage() {
                             {formatTime(sessionTime)}
                         </div>
                         <div className="flex items-center gap-2">
-                            <div
-                                className={`h-2 w-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'
-                                    }`}
-                            />
+                            <div className={`h-2 w-2 rounded-full ${isRecording ? 'bg-green-500' : 'bg-red-500'}`}/>
                             <span className="text-sm text-zinc-500 dark:text-zinc-400">
-                                {isConnected ? 'Connected' : 'Disconnected'}
+                                {isRecording ? 'Listening' : 'Ready'}
                             </span>
                         </div>
                     </div>
                 </div>
             </header>
 
-            {/* Main content */}
             <main className="mx-auto max-w-6xl px-4 py-6">
-                {/* Error display */}
                 {(error || recordingError) && (
                     <div className="mb-4 rounded-lg bg-red-50 p-4 text-red-700 dark:bg-red-950 dark:text-red-300">
                         {error || recordingError}
                     </div>
                 )}
 
-                {/* System audio warning */}
-                {systemAudioError && (
-                    <div className="mb-4 rounded-lg bg-amber-50 p-4 text-amber-700 dark:bg-amber-950 dark:text-amber-300">
-                        {systemAudioError}
-                    </div>
-                )}
-
-                {/* Credits Display */}
-                {!featuresLoading && (
-                    <div className="mb-4 text-sm text-zinc-500 dark:text-zinc-400">
-                        Credits remaining: <span className="font-medium text-zinc-700 dark:text-zinc-300">{interview_credits}</span>
-                    </div>
-                )}
-
-                {/* Recording controls and audio level */}
                 <div className="mb-6 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
                     <div className="mb-4">
                         <RecordingControls
                             isRecording={isRecording}
                             isPaused={isPaused}
-                            isConnected={isConnected}
-                            disabled={featuresLoading}
-                            captureSystemAudio={captureSystemAudio}
-                            isCapturingSystemAudio={isCapturingSystemAudio}
-                            onCaptureSystemAudioChange={handleCaptureSystemAudioChange}
-                            onStart={handleStart}
-                            onStop={handleStop}
+                            isConnected={true} // Bypassing websocket requirement
+                            disabled={false}
+                            captureSystemAudio={false}
+                            isCapturingSystemAudio={false}
+                            onCaptureSystemAudioChange={() => {}}
+                            onStart={startRecording}
+                            onStop={stopRecording}
                             onPause={pauseRecording}
                             onResume={resumeRecording}
                             onClear={handleClear}
@@ -542,13 +286,11 @@ export default function PracticePage() {
                         <span className="text-sm text-zinc-500 dark:text-zinc-400">
                             Audio Level:
                         </span>
-                        <AudioLevelIndicator level={audioLevel} isRecording={isRecording} />
+                        <AudioLevelIndicator level={isRecording && !isPaused ? 50 : 0} isRecording={isRecording} />
                     </div>
                 </div>
 
-                {/* Two column layout */}
                 <div className="grid gap-6 lg:grid-cols-2">
-                    {/* Left: Transcription */}
                     <div>
                         <TranscriptionDisplay
                             currentText={currentText}
@@ -556,70 +298,33 @@ export default function PracticePage() {
                             isProcessing={isRecording}
                             processingState={processingState}
                             onGenerateAnswer={handleManualGenerate}
-                            canGenerate={isPaused && accumulatedText.length > 0 && !isGenerating}
+                            canGenerate={!isGenerating && accumulatedText.length > 0}
                         />
                     </div>
 
-                    {/* Right: Answer suggestions */}
                     <div>
                         <AnswerDisplay
                             answers={answers}
                             isGenerating={isGenerating}
-                            temporaryAnswer={temporaryAnswer}
+                            temporaryAnswer={null}
                             streamingAnswer={streamingAnswer}
                             streamingQuestion={streamingQuestion}
                             onRegenerate={handleRegenerate}
-                            onStopGenerating={handleStopGenerating}
+                            onStopGenerating={() => setIsGenerating(false)}
                         />
-                        {answers.length > 0 && (
-                            <div className="mt-3 flex items-center gap-2">
-                                <span className="text-sm text-gray-500 dark:text-gray-400">Was this helpful?</span>
-                                <button
-                                    onClick={() => { sendFeedback(1); setFeedbackGiven(1); }}
-                                    disabled={feedbackGiven !== null}
-                                    className={`rounded px-2 py-1 text-sm transition-colors ${
-                                        feedbackGiven === 1
-                                            ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'
-                                            : 'bg-gray-100 text-gray-600 hover:bg-green-50 hover:text-green-600 dark:bg-gray-800 dark:text-gray-400 dark:hover:bg-green-950 dark:hover:text-green-400'
-                                    }`}
-                                >
-                                    👍
-                                </button>
-                                <button
-                                    onClick={() => { sendFeedback(-1); setFeedbackGiven(-1); }}
-                                    disabled={feedbackGiven !== null}
-                                    className={`rounded px-2 py-1 text-sm transition-colors ${
-                                        feedbackGiven === -1
-                                            ? 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300'
-                                            : 'bg-gray-100 text-gray-600 hover:bg-red-50 hover:text-red-600 dark:bg-gray-800 dark:text-gray-400 dark:hover:bg-red-950 dark:hover:text-red-400'
-                                    }`}
-                                >
-                                    👎
-                                </button>
-                                {feedbackGiven !== null && (
-                                    <span className="text-xs text-gray-400">Thanks for your feedback!</span>
-                                )}
-                            </div>
-                        )}
                     </div>
                 </div>
-
+                
                 {/* Instructions */}
                 <div className="mt-4 rounded-lg border border-blue-200 bg-blue-50 p-4 dark:border-blue-800 dark:bg-blue-950">
                     <h3 className="mb-2 font-medium text-blue-900 dark:text-blue-100">
-                        How to use (Manual Control)
+                        How to use (Gemini Native Integration)
                     </h3>
                     <ol className="list-inside list-decimal space-y-2 text-sm text-blue-800 dark:text-blue-200">
-                        <li><strong>Start Recording</strong> - Begin recording session</li>
-                        <li><strong>Speak your question</strong> - Audio will be transcribed in real-time</li>
-                        <li><strong>Pause</strong> when finished speaking - This enables answer generation</li>
-                        <li><strong>Click "Generate Answer"</strong> - Get AI-powered feedback</li>
-                        <li><strong>Resume</strong> to continue the interview</li>
-                        <li><strong>Clear</strong> to reset everything</li>
+                        <li><strong>Start Recording</strong> - The browser will securely listen to your microphone natively.</li>
+                        <li><strong>Speak your question</strong> - Wait ~1.5 seconds when finished speaking.</li>
+                        <li><strong>Auto-Generate</strong> - The app will automatically transcribe your voice and ask your Gemini API for an answer!</li>
                     </ol>
-                    <div className="mt-3 rounded bg-blue-100 dark:bg-blue-900 p-2 text-xs text-blue-700 dark:text-blue-300">
-                        <strong>Tip:</strong> Pause during questions, Resume to process. This gives you control and better accuracy.
-                    </div>
                 </div>
             </main>
         </div>
