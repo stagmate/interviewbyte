@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>InterviewMate Overlay</string>
+    <key>CFBundleIdentifier</key>
+    <string>ing.interviewmate.overlay</string>
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>LSUIElement</key>
+    <false/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>InterviewMate needs microphone access for speech recognition during interviews.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>InterviewMate needs screen recording access to capture interviewer audio from Zoom/Google Meet.</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>InterviewMateOverlay</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
+</dict>
+</plist>

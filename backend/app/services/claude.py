@@ -1,0 +1,1405 @@
+"""
+Anthropic Claude API integration for AI answer generation with semantic similarity matching
+"""
+
+import asyncio
+import re
+import logging
+from typing import Optional, List
+from difflib import SequenceMatcher
+from anthropic import Anthropic
+from openai import AsyncOpenAI
+from pydantic import BaseModel, Field
+from app.core.config import settings
+from supabase import Client
+
+# 로거 설정
+logger = logging.getLogger(__name__)
+
+
+def normalize_question(question: str) -> str:
+    """
+    Normalize question for cache key generation.
+    Removes punctuation, extra spaces, and converts to lowercase.
+    """
+    # Remove punctuation and convert to lowercase
+    normalized = re.sub(r'[^\w\s]', '', question.lower())
+    # Remove extra spaces
+    normalized = ' '.join(normalized.split())
+    return normalized
+
+
+def calculate_similarity(str1: str, str2: str) -> float:
+    """
+    Calculate similarity ratio between two strings with intelligent matching.
+
+    Uses multiple strategies:
+    1. Exact substring matching (only if shorter string is substantial)
+    2. Token-based overlap (Jaccard similarity)
+    3. Sequence matching (difflib)
+
+    Returns a value between 0 and 1, where 1 is identical.
+    """
+    # Strategy 1: Substring matching — only when shorter string is substantial
+    # (at least 5 words AND at least 40% of the longer string's length)
+    # This prevents "why" matching "why do you want to work here"
+    # CRITICAL: Must check str1 != str2 first — equal-length strings cause
+    # min/max(key=len) to return the same object, making "x in x" always True
+    if len(str1) != len(str2):
+        shorter = min(str1, str2, key=len)
+        longer = max(str1, str2, key=len)
+        if shorter in longer:
+            shorter_tokens = len(shorter.split())
+            if shorter_tokens >= 5 and len(shorter) >= len(longer) * 0.4:
+                return 0.95
+    elif str1 == str2:
+        return 1.0
+
+    # Strategy 2: Token-based overlap (Jaccard only — no containment)
+    # Containment was causing false positives with short queries
+    tokens1 = set(str1.split())
+    tokens2 = set(str2.split())
+
+    if tokens1 and tokens2:
+        intersection = tokens1 & tokens2
+        union = tokens1 | tokens2
+        token_similarity = len(intersection) / len(union)
+    else:
+        token_similarity = 0.0
+
+    # Strategy 3: Sequence matching (original approach)
+    sequence_similarity = SequenceMatcher(None, str1, str2).ratio()
+
+    # Return the maximum similarity from all strategies
+    return max(token_similarity, sequence_similarity)
+
+
+# Phase 1.2: Pattern-based question detection
+QUESTION_PATTERNS = {
+    # Behavioral questions (STAR method)
+    "behavioral": [
+        r"tell\s+(me|us)\s+about\s+(yourself|a\s+time)",
+        r"describe\s+(a\s+time|an?\s+situation|an?\s+experience)",
+        r"give\s+(me|us)\s+an?\s+example",
+        r"walk\s+(me|us)\s+through",
+        r"share\s+(a\s+story|an?\s+experience)",
+        r"what('?s|\s+is)\s+your\s+(biggest|greatest)\s+(strength|weakness|achievement)",
+        r"how\s+do\s+you\s+(handle|deal\s+with|approach)",
+        r"have\s+you\s+ever",
+        r"can\s+you\s+tell",
+    ],
+    # Technical questions
+    "technical": [
+        r"how\s+(would|do)\s+you\s+(design|build|implement|architect)",
+        r"what('?s|\s+is)\s+the\s+(difference|time\s+complexity)",
+        r"explain\s+(how|what|why)",
+        r"what\s+(are\s+the\s+)?(trade[-\s]?offs|benefits)",
+        r"how\s+(does|would)\s+(this|that)\s+(work|scale)",
+        r"what\s+technologies",
+        r"which\s+(algorithm|approach|pattern)",
+    ],
+    # Situational questions
+    "situational": [
+        r"what\s+would\s+you\s+do\s+(if|when)",
+        r"how\s+would\s+you\s+(handle|approach|solve)",
+        r"imagine\s+(you|that)",
+        r"suppose\s+(you|that)",
+        r"if\s+you\s+(were|had\s+to)",
+    ],
+    # General/fit questions
+    "general": [
+        r"^why\s+(do\s+you\s+want|are\s+you\s+interested|openai)",
+        r"what\s+(interests|excites|motivates)\s+you",
+        r"where\s+do\s+you\s+see\s+yourself",
+        r"what\s+(are\s+your|do\s+you\s+know\s+about)",
+        r"^do\s+you\s+have\s+(any\s+)?questions",
+        r"is\s+there\s+anything",
+        r"tell\s+(me|us)\s+about\s+(openai|this\s+role)",
+    ]
+}
+
+# Compile patterns once for performance
+COMPILED_PATTERNS = {
+    qtype: [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
+    for qtype, patterns in QUESTION_PATTERNS.items()
+}
+
+
+def detect_question_fast(text: str) -> dict:
+    """
+    OPTIMIZED: Fast pattern-based question detection (Phase 1.2).
+
+    Performance comparison:
+    - Old detect_question(): ~1000ms (Claude API call)
+    - New detect_question_fast(): <1ms (regex pattern matching)
+
+    Args:
+        text: Transcribed text to analyze
+
+    Returns:
+        {
+            "is_question": bool,
+            "question": str,
+            "question_type": str,
+            "confidence": str ("high"/"medium"/"low")
+        }
+    """
+    if not text or len(text.strip()) < 5:
+        return {
+            "is_question": False,
+            "question": "",
+            "question_type": "none",
+            "confidence": "high"
+        }
+
+    text_clean = text.strip()
+    text_lower = text_clean.lower()
+
+    # Step 1: Obvious question markers
+    has_question_mark = '?' in text
+    starts_with_question_word = any(
+        text_lower.startswith(word) for word in [
+            'what', 'how', 'why', 'when', 'where', 'who', 'which',
+            'can you', 'could you', 'would you', 'will you',
+            'do you', 'did you', 'have you', 'tell me', 'describe'
+        ]
+    )
+
+    # Step 2: Pattern matching for question type
+    matched_type = None
+    for qtype, patterns in COMPILED_PATTERNS.items():
+        for pattern in patterns:
+            if pattern.search(text_lower):
+                matched_type = qtype
+                break
+        if matched_type:
+            break
+
+    # Step 3: Determine if it's a question
+    is_question = has_question_mark or starts_with_question_word or (matched_type is not None)
+
+    # Step 4: Determine confidence
+    # Questions with ? but no interview pattern and short length are "low" confidence
+    # so the caller can verify with Claude API whether it's actually an interview question
+    word_count = len(text_lower.split())
+    if has_question_mark and matched_type:
+        confidence = "high"
+    elif matched_type:
+        confidence = "high"
+    elif has_question_mark and starts_with_question_word and word_count >= 6:
+        confidence = "medium"
+    elif starts_with_question_word and word_count >= 6:
+        confidence = "medium"
+    elif has_question_mark and word_count < 8 and not starts_with_question_word:
+        # Short question with ? but no interview pattern — likely not an interview question
+        # e.g., "Should I walk or drive?" "What time is it?"
+        confidence = "low"
+    elif has_question_mark:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return {
+        "is_question": is_question,
+        "question": text_clean if is_question else "",
+        "question_type": matched_type or "general" if is_question else "none",
+        "confidence": confidence
+    }
+
+
+# Pydantic schemas for OpenAI Structured Outputs
+class QAPairItem(BaseModel):
+    question: str = Field(description="The interview question")
+    answer: str = Field(description="The corresponding answer")
+    question_type: str = Field(description="Type: behavioral, technical, situational, or general")
+
+
+class QAPairList(BaseModel):
+    qa_pairs: List[QAPairItem] = Field(description="List of Q&A pairs extracted from text")
+
+
+class DecomposedQueries(BaseModel):
+    """Pydantic model for decomposing complex questions into atomic sub-questions"""
+    queries: List[str] = Field(description="List of atomic sub-questions derived from the complex question")
+
+
+class ClaudeService:
+    def __init__(self, supabase: Optional[Client] = None, qdrant_service=None):
+        self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        self.openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        self.model = "claude-sonnet-4-6"
+
+        # Initialize vector search service (Qdrant only)
+        self.qdrant_service = qdrant_service
+        self.semantic_threshold = 0.80  # 80% cosine similarity threshold
+
+        # Simple in-memory cache for answers
+        # Format: {normalized_question: {"question": original, "answer": generated_answer}}
+        self._answer_cache = {}
+        self._cache_similarity_threshold = 0.85  # 85% similarity to use cached answer
+        self._max_cache_size = 50  # Limit cache size to prevent memory issues
+
+        # Per-user Q&A index for fast lookup (Phase 1.1 optimization)
+        # Format: {user_id: {normalized_question: qa_pair_dict}}
+        self._qa_indices = {}
+        self._qa_pairs_lists = {}  # {user_id: [qa_pairs]} for similarity fallback
+
+        logger.info("Claude service initialized with OpenAI Embeddings and Anthropic Prompt Caching")
+
+    async def decompose_question(self, question: str) -> List[str]:
+        """
+        Decompose a compound interview question into atomic sub-questions.
+
+        Uses fast heuristic split (regex) instead of LLM call.
+        Saves 500-2000ms per question by avoiding gpt-4o API round-trip.
+
+        Args:
+            question: The potentially compound interview question
+
+        Returns:
+            List of atomic sub-questions (max 3, or single-item list if simple)
+        """
+        # Detect compound signals
+        compound_patterns = [
+            r'\b(?:and also|and then|and how|and why|and what|and tell)\b',
+            r'\b(?:but also|as well as)\b',
+            r'[?].*[?]',  # Multiple question marks
+        ]
+        is_compound = any(re.search(p, question, re.IGNORECASE) for p in compound_patterns)
+
+        if not is_compound:
+            # Single-intent question: search as-is (most interview questions)
+            return [question]
+
+        # Compound question: split on conjunctions
+        parts = re.split(
+            r'\s+(?:and\s+(?:also|then|how|why|what|tell)|but\s+also|as\s+well\s+as|however|also)\s+',
+            question,
+            flags=re.IGNORECASE
+        )
+        queries = [p.strip() for p in parts if p.strip() and len(p.strip()) > 10]
+
+        if len(queries) <= 1:
+            # Split didn't produce multiple meaningful parts
+            return [question]
+
+        logger.info(f"Heuristic split: {len(queries)} sub-questions from compound question")
+        return queries[:3]
+
+    async def find_relevant_qa_pairs(
+        self,
+        question: str,
+        user_id: str,
+        max_total_results: int = 5
+    ) -> List[dict]:
+        """
+        Find multiple relevant Q&A pairs for a potentially complex question.
+
+        This is the KEY method that enables multi-intent handling:
+        1. Decompose question into sub-questions
+        2. Search for each sub-question using semantic similarity
+        3. Deduplicate and rank results
+        4. Return top N most relevant Q&A pairs
+
+        Args:
+            question: The user's question (may be complex/compound)
+            user_id: User ID for database search
+            max_total_results: Maximum number of Q&A pairs to return
+
+        Returns:
+            List of relevant Q&A pairs with similarity scores, sorted by relevance
+        """
+        if not self.qdrant_service:
+            logger.warning("Qdrant service not available for semantic search")
+            return []
+
+        try:
+            # Step 1: Decompose question into atomic sub-questions
+            logger.warning(f"RAG_SEARCH: Decomposing question: '{question}'")
+            sub_questions = await self.decompose_question(question)
+            logger.warning(f"RAG_SEARCH: Decomposed into {len(sub_questions)} sub-questions: {sub_questions}")
+
+            # Step 2: PARALLEL searches using asyncio.gather
+            async def search_one(sub_q: str, index: int) -> List[dict]:
+                """Search for one sub-question with timeout and error handling"""
+                try:
+                    logger.warning(f"RAG_SEARCH: [{index+1}/{len(sub_questions)}] Searching for: '{sub_q[:60]}...'")
+
+                    # Add 5s timeout per search
+                    async with asyncio.timeout(5.0):
+                        matches = await self.qdrant_service.search_similar_qa_pairs(
+                            query_text=sub_q,
+                            user_id=user_id,
+                            similarity_threshold=0.55,
+                            limit=3
+                        )
+
+                    logger.warning(f"RAG_SEARCH: [{index+1}/{len(sub_questions)}] Found {len(matches)} matches")
+
+                    # Log similarity scores
+                    for match in matches:
+                        logger.warning(
+                            f"RAG_SEARCH: Match - Q: '{match.get('question', '')[:80]}...' "
+                            f"Similarity: {match.get('similarity', 0):.4f}"
+                        )
+
+                    return matches
+
+                except asyncio.TimeoutError:
+                    logger.warning(f"RAG_SEARCH: Search timed out (5s) for: '{sub_q[:60]}...'")
+                    return []
+                except Exception as e:
+                    logger.error(f"RAG_SEARCH: Search failed for '{sub_q[:60]}...': {e}")
+                    return []
+
+            # Run all searches in PARALLEL
+            logger.info(f"RAG_SEARCH: Starting {len(sub_questions)} parallel searches")
+            search_results = await asyncio.gather(
+                *[search_one(sq, i) for i, sq in enumerate(sub_questions)]
+            )
+
+            # Step 3: Deduplicate and merge results from all searches
+            all_matches = []
+            seen_ids = set()
+
+            for matches in search_results:
+                for match in matches:
+                    # Deduplicate by ID
+                    if match['id'] not in seen_ids:
+                        all_matches.append(match)
+                        seen_ids.add(match['id'])
+
+            # Step 4: Sort by similarity (highest first) and limit results
+            all_matches.sort(key=lambda x: x.get('similarity', 0), reverse=True)
+            top_matches = all_matches[:max_total_results]
+
+            logger.info(
+                f"Found {len(top_matches)} relevant Q&A pairs for '{question}' "
+                f"(from {len(sub_questions)} sub-questions)"
+            )
+
+            # Log matches for debugging
+            for i, match in enumerate(top_matches, 1):
+                logger.info(
+                    f"  {i}. [{match.get('similarity', 0):.2%}] "
+                    f"{match.get('question', '')[:60]}..."
+                )
+
+            return top_matches
+
+        except Exception as e:
+            logger.error(f"Error finding relevant Q&A pairs: {str(e)}", exc_info=True)
+            return []
+
+    def _get_cached_answer(self, question: str, user_id: Optional[str] = None) -> Optional[str]:
+        """
+        Check cache for similar questions and return cached answer if found.
+        
+        CRITICAL: Cache usage must be scoped to user_id to prevent privacy leaks.
+
+        Args:
+            question: The question to check
+            user_id: The ID of the user asking the question
+
+        Returns:
+            Cached answer if similar question found, None otherwise
+        """
+        if not user_id:
+            logger.warning("Cache access without user_id - skipping cache to prevent leakage")
+            return None
+            
+        normalized_q = normalize_question(question)
+        
+        # Scope cache key to user
+        cache_key = f"{user_id}:{normalized_q}"
+
+        # First check exact match
+        if cache_key in self._answer_cache:
+            logger.info(f"Cache hit (exact): '{question}' for user {user_id}")
+            return self._answer_cache[cache_key]["answer"]
+
+        # Check for similar questions
+        # Note: This O(N) iteration is fine for small caches (50 items), 
+        # but we should filter by user_id prefix if cache grows large.
+        for cached_key, cached_data in self._answer_cache.items():
+            # Check if this cache entry belongs to this user
+            if not cached_key.startswith(f"{user_id}:"):
+                continue
+                
+            cached_q_normalized = cached_key.split(":", 1)[1] if ":" in cached_key else ""
+            
+            similarity = calculate_similarity(normalized_q, cached_q_normalized)
+            if similarity >= self._cache_similarity_threshold:
+                logger.info(f"Cache hit (similar, {similarity:.2%}): '{question}' ~ '{cached_data['question']}' for user {user_id}")
+                return cached_data["answer"]
+
+        logger.debug(f"Cache miss: '{question}' for user {user_id}")
+        return None
+
+    def _cache_answer(self, question: str, answer: str, user_id: Optional[str] = None):
+        """
+        Cache the generated answer for future use.
+
+        Args:
+            question: The original question
+            answer: The generated answer
+            user_id: The ID of the user
+        """
+        if not user_id:
+            logger.warning("Attempted to cache answer without user_id - skipping")
+            return
+
+        normalized_q = normalize_question(question)
+        cache_key = f"{user_id}:{normalized_q}"
+
+        # Implement simple LRU: remove oldest if cache is full
+        if len(self._answer_cache) >= self._max_cache_size:
+            # Remove first item (oldest in insertion order for Python 3.7+)
+            oldest_key = next(iter(self._answer_cache))
+            del self._answer_cache[oldest_key]
+            logger.debug(f"Cache full, removed oldest entry: '{oldest_key}'")
+
+        self._answer_cache[cache_key] = {
+            "question": question,
+            "answer": answer
+        }
+        logger.info(f"Cached answer for: '{question}' (user: {user_id}, cache size: {len(self._answer_cache)})")
+
+    def clear_cache(self):
+        """Clear the answer cache and all per-user Q&A indices."""
+        self._answer_cache.clear()
+        self._qa_indices.clear()
+        self._qa_pairs_lists.clear()
+        logger.info("Answer cache cleared")
+
+    def build_qa_index(self, qa_pairs: list, user_id: str = None):
+        """
+        Build per-user in-memory index of Q&A pairs for fast lookup.
+        Call this when context is updated with Q&A pairs.
+
+        Args:
+            qa_pairs: List of Q&A pair dicts from database
+            user_id: User ID to scope the index (prevents cross-user contamination)
+
+        Performance: O(n*m) where n = number of Q&A pairs, m = avg variations per pair
+        This runs once when context is loaded, enabling O(1) exact match
+        and faster similarity matching afterward.
+        """
+        key = user_id or "__anonymous__"
+        self._qa_indices[key] = {}
+        self._qa_pairs_lists[key] = qa_pairs
+
+        total_entries = 0
+        for qa_pair in qa_pairs:
+            # Index main question
+            question = qa_pair.get("question", "")
+            normalized = normalize_question(question)
+            self._qa_indices[key][normalized] = qa_pair
+            total_entries += 1
+
+            # Index all question variations
+            variations = qa_pair.get("question_variations", [])
+            if variations:
+                for variation in variations:
+                    if variation and variation.strip():
+                        normalized_var = normalize_question(variation)
+                        self._qa_indices[key][normalized_var] = qa_pair
+                        total_entries += 1
+
+        logger.info(f"Built Q&A index for user {key} with {total_entries} entries from {len(qa_pairs)} Q&A pairs (including variations)")
+
+    def find_matching_qa_pair_fast(self, question: str, user_id: str = None) -> Optional[dict]:
+        """
+        OPTIMIZED: Find matching Q&A pair using pre-built per-user index.
+
+        Performance comparison:
+        - Old find_matching_qa_pair(): 500ms (O(n) similarity checks)
+        - New find_matching_qa_pair_fast(): <1ms (O(1) hash lookup + early exit)
+
+        Args:
+            question: The detected interview question
+            user_id: User ID to scope the lookup (prevents cross-user contamination)
+
+        Returns:
+            Matching Q&A pair if found (similarity >= 85%), None otherwise
+        """
+        key = user_id or "__anonymous__"
+        qa_index = self._qa_indices.get(key, {})
+
+        if not qa_index:
+            logger.warning(f"Q&A index not built for user {key} - call build_qa_index() first")
+            return None
+
+        normalized_q = normalize_question(question)
+        threshold = 0.85  # 85% similarity threshold
+
+        # Step 1: O(1) exact match check using hash index
+        if normalized_q in qa_index:
+            qa_pair = qa_index[normalized_q]
+            logger.info(f"✓ Exact Q&A match: '{question}' (user: {key}, took <1ms)")
+            return qa_pair
+
+        # Step 2: Similarity matching with early exit optimization
+        best_match = None
+        best_similarity = 0.0
+
+        for normalized_qa, qa_pair in qa_index.items():
+            similarity = calculate_similarity(normalized_q, normalized_qa)
+
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_match = qa_pair
+
+                # Early exit: if we find a very high match, stop searching
+                if similarity >= 0.95:
+                    logger.warning(f"QA_FAST_MATCH: Near-exact ({similarity:.2%}): '{question[:80]}' ~ '{qa_pair['question'][:80]}' (user: {key})")
+                    return best_match
+
+        # Step 3: Return best match if above threshold
+        if best_similarity >= threshold:
+            logger.warning(f"QA_FAST_MATCH: Similar ({best_similarity:.2%}): '{question[:80]}' ~ '{best_match['question'][:80]}' (user: {key})")
+            return best_match
+
+        logger.info(f"QA_FAST_MATCH: No match for user {key} (best: {best_similarity:.2%}, needed: {threshold})")
+        return None
+
+    async def generate_answer_stream(
+        self,
+        question: str,
+        resume_text: str = "",
+        star_stories: list = None,
+        talking_points: list = None,
+        qa_pairs: list = None,
+        format: str = "paragraph",
+        user_profile: Optional[dict] = None,
+        session_history: list = None,
+        examples_used: list = None,
+        pre_fetched_qa_pairs: list = None
+    ):
+        """
+        Generate streaming answer with Claude API (REAL-TIME DISPLAY).
+
+        Uses RAG approach for complex questions (same as generate_answer).
+
+        Args:
+            question: The interview question
+            resume_text: User's resume content
+            star_stories: List of STAR stories
+            talking_points: List of key talking points
+            session_history: Previous Q&A from this session
+            examples_used: Examples already used in this session
+            qa_pairs: List of prepared Q&A pairs
+            format: "bullet" or "paragraph" (for compatibility)
+
+        Yields:
+            str: Text chunks as they're generated
+        """
+        star_stories = star_stories or []
+        talking_points = talking_points or []
+        qa_pairs = qa_pairs or []
+
+        # Initialize session tracking
+        session_history = session_history or []
+        examples_used = examples_used or []
+
+        # RAG APPROACH: Use pre-fetched results if available (parallelized by caller)
+        user_id = user_profile.get('user_id') if user_profile else None
+
+        if pre_fetched_qa_pairs is not None:
+            relevant_qa_pairs = pre_fetched_qa_pairs
+            logger.info(f"Using pre-fetched RAG results: {len(relevant_qa_pairs)} pairs")
+        else:
+            relevant_qa_pairs = []
+            if user_id and self.qdrant_service:
+                relevant_qa_pairs = await self.find_relevant_qa_pairs(
+                    question=question,
+                    user_id=user_id,
+                    max_total_results=5
+                )
+
+        # If we found a very high match (>= 85% similarity), use the stored answer directly
+        # 0.70 was too low — caused irrelevant Q&A pairs to bypass LLM generation
+        if relevant_qa_pairs and relevant_qa_pairs[0].get('similarity', 0) >= 0.85:
+            best_match = relevant_qa_pairs[0]
+            logger.info(f"RAG direct match ({best_match.get('similarity', 0):.0%}): skipping LLM, using stored answer for '{question[:60]}'")
+            yield best_match['answer']
+            return
+
+        logger.debug(f"Generating new answer for: '{question[:50]}...' ({len(relevant_qa_pairs)} RAG results)")
+
+        # Build context (same as non-streaming)
+        context_parts = []
+        if resume_text:
+            context_parts.append(f"RESUME:\n{resume_text}")
+        if star_stories:
+            stories_text = "\n\n".join([
+                f"Story: {s.get('title', 'Untitled')}\n"
+                f"Situation: {s.get('situation', '')}\n"
+                f"Task: {s.get('task', '')}\n"
+                f"Action: {s.get('action', '')}\n"
+                f"Result: {s.get('result', '')}"
+                for s in star_stories
+            ])
+            context_parts.append(f"STAR STORIES:\n{stories_text}")
+        if talking_points:
+            points_text = "\n".join([f"- {p.get('content', '')}" for p in talking_points])
+            context_parts.append(f"KEY TALKING POINTS:\n{points_text}")
+
+        # RAG: Add relevant Q&A pairs found via semantic search
+        if relevant_qa_pairs:
+            qa_text = "\n\n".join([
+                f"Q: {qa.get('question', '')}\n"
+                f"A: {qa.get('answer', '')}\n"
+                f"(Similarity: {qa.get('similarity', 0):.1%})"
+                for qa in relevant_qa_pairs[:5]
+            ])
+            context_parts.append(f"RELEVANT PREPARED ANSWERS (use ONLY if directly relevant to the question — if none match, ignore them and answer from STAR stories/background instead):\n{qa_text}")
+        elif qa_pairs:
+            # Fallback: RAG found nothing, include all Q&A pairs so Claude can reference them
+            qa_text = "\n\n".join([
+                f"Q: {qa.get('question', '')}\n"
+                f"A: {qa.get('answer', '')}"
+                for qa in qa_pairs[:15]
+            ])
+            context_parts.append(f"CANDIDATE'S PREPARED Q&A PAIRS (use these as reference for your answer):\n{qa_text}")
+
+        # Add session history (to avoid repeating same examples)
+        if session_history:
+            history_text = "\n\n".join([
+                f"{'Interviewer' if msg.get('role') == 'interviewer' else 'You'}: {msg.get('content', '')}"
+                for msg in session_history[-5:]  # Last 5 exchanges
+            ])
+            context_parts.append(f"SESSION HISTORY (previous questions/answers in this interview):\n{history_text}")
+
+        # Add examples already used (CRITICAL: avoid repetition)
+        if examples_used:
+            examples_text = "\n- ".join(examples_used)
+            context_parts.append(f"EXAMPLES ALREADY USED IN THIS SESSION (DO NOT REPEAT):\n- {examples_text}")
+
+        context = "\n\n---\n\n".join(context_parts) if context_parts else "No specific context provided."
+
+        # Use same system prompt as non-streaming
+        system_prompt = self._get_system_prompt(user_profile)
+
+        # Detect question type and frustration level
+        context_info = self._detect_question_context(question)
+        qtype = context_info["type"]
+        frustrated = context_info["frustrated"]
+        max_tokens = context_info["max_tokens"]
+        instruction = context_info["instruction"]
+
+        # Add instruction about avoiding repetition if examples were used
+        repetition_warning = ""
+        if examples_used:
+            repetition_warning = f"\n\n🚨 CRITICAL: You have already used these examples/stories in this session:\n- {chr(10).join(['- ' + ex for ex in examples_used])}\n\nYou MUST use DIFFERENT examples or stories this time. DO NOT repeat the same examples."
+
+        # Add RAG synthesis instruction if we found multiple relevant Q&A pairs
+        rag_instruction = ""
+        if len(relevant_qa_pairs) > 1:
+            rag_instruction = f"\n\nNote: {len(relevant_qa_pairs)} relevant prepared answers provided above. Synthesize them into one cohesive response following the {instruction} guideline."
+
+        user_prompt = f"""CANDIDATE BACKGROUND:
+{context}
+
+INTERVIEW QUESTION:
+{question}
+{repetition_warning}
+{rag_instruction}
+
+Generate a suggested answer ({instruction}):"""
+
+        try:
+            # Claude streaming API with prompt caching
+            with self.client.messages.stream(
+                model=self.model,
+                max_tokens=max_tokens,
+                system=[
+                    {
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": {"type": "ephemeral"}  # Enable prompt caching
+                    }
+                ],
+                messages=[{"role": "user", "content": user_prompt}]
+            ) as stream:
+                for text in stream.text_stream:
+                    yield text
+
+            final_message = stream.get_final_message()
+            logger.warning(f"[Streaming] Requested: {self.model} | Actual: {final_message.model} | Usage: input={final_message.usage.input_tokens}, output={final_message.usage.output_tokens}")
+
+        except Exception as e:
+            logger.error(f"Claude streaming error: {str(e)}", exc_info=True)
+            yield "\n\n⚠️ Error generating answer. Please try again."
+
+    def _detect_question_context(self, question: str) -> dict:
+        """
+        Detect question type and interviewer frustration level.
+
+        Returns:
+            {
+                "type": "yes_no" | "direct" | "deep_dive" | "clarification" | "general",
+                "frustrated": bool,
+                "max_tokens": int,
+                "instruction": str
+            }
+        """
+        question_lower = question.lower()
+
+        # Detect frustration signals
+        frustration_phrases = [
+            "stop", "hold on", "whoa",
+            "that's not what i asked", "i didn't ask",
+            "you're doing it again", "answer the question",
+            "i just told you", "i asked you", "listen"
+        ]
+        is_frustrated = any(phrase in question_lower for phrase in frustration_phrases)
+
+        # Detect question type
+        yes_no_phrases = ["yes or no", "correct?", "is this", "is that", "would you tell"]
+        direct_phrases = ["what is", "what would", "when did", "where is", "how much", "how many"]
+        deep_dive_phrases = [
+            "walk me through", "explain how", "tell me about", "describe", "talk about",
+            "can you share", "share with", "how does your", "how would you",
+            "why do you", "what excites", "what draws you", "what motivates",
+            "how did you", "how do you", "what makes you",
+        ]
+        clarification_phrases = ["what do you mean", "can you clarify", "i don't understand"]
+
+        # Detect compound questions (two+ parts joined by "and how", "and what", "and why")
+        is_compound = bool(
+            " and how " in question_lower
+            or " and what " in question_lower
+            or " and why " in question_lower
+            or " and can you " in question_lower
+        )
+
+        if any(phrase in question_lower for phrase in yes_no_phrases):
+            qtype = "yes_no"
+            max_tokens = 40 if is_frustrated else 60
+            instruction = "CRITICAL: YES/NO question - Answer in MAXIMUM 5-10 WORDS"
+        elif any(phrase in question_lower for phrase in direct_phrases) and not is_compound:
+            qtype = "direct"
+            max_tokens = 80 if is_frustrated else 200
+            instruction = "Direct question - Answer concisely using PREP structure"
+        elif any(phrase in question_lower for phrase in deep_dive_phrases) or is_compound:
+            qtype = "deep_dive"
+            max_tokens = 200 if is_frustrated else 500
+            instruction = "Deep-dive question - Give a thorough answer using your specific background and prepared answers"
+        elif any(phrase in question_lower for phrase in clarification_phrases):
+            qtype = "clarification"
+            max_tokens = 60 if is_frustrated else 150
+            instruction = "Clarification - Answer in MAXIMUM 30 WORDS"
+        else:
+            qtype = "general"
+            max_tokens = 150 if is_frustrated else 400
+            instruction = "Answer using your specific background and experiences"
+
+        # If frustrated, add explicit warning
+        if is_frustrated:
+            instruction = f"🚨 INTERVIEWER IS FRUSTRATED - BE ULTRA BRIEF! {instruction}"
+
+        return {
+            "type": qtype,
+            "frustrated": is_frustrated,
+            "max_tokens": max_tokens,
+            "instruction": instruction
+        }
+
+    def _get_system_prompt(self, user_profile: Optional[dict] = None) -> str:
+        """
+        Generate system prompt from user profile.
+
+        Args:
+            user_profile: Dict with keys: full_name, target_role, target_company,
+                         projects_summary, answer_style, custom_instructions, etc.
+
+        Returns:
+            System prompt string combining base prompt + user's custom instructions
+        """
+        # Extract profile data with defaults
+        if user_profile:
+            name = user_profile.get('full_name') or 'the candidate'
+            role = user_profile.get('target_role') or 'your target role'
+            company = user_profile.get('target_company') or 'the company'
+            projects = user_profile.get('projects_summary') or ''
+            style = user_profile.get('answer_style', 'balanced')
+            strengths = user_profile.get('key_strengths', [])
+        else:
+            # Default fallback (for backward compatibility)
+            name = 'the candidate'
+            role = 'your target role'
+            company = 'the company'
+            projects = ''
+            style = 'balanced'
+            strengths = []
+
+        # Build strengths section
+        strengths_text = ''
+        if strengths:
+            strengths_list = '\n'.join([f"- {s}" for s in strengths])
+            strengths_text = f"\n\n**Key Strengths to Emphasize:**\n{strengths_list}"
+
+        # Style-specific instructions
+        style_instructions = {
+            'concise': '- Be extremely concise and direct\n- Prefer bullet points over paragraphs\n- Maximum 30 words for most answers',
+            'balanced': '- Balance detail with brevity\n- Use 30-60 words for most answers\n- Provide context but stay focused',
+            'detailed': '- Provide comprehensive explanations\n- Use 60-100 words when appropriate\n- Include relevant context and examples'
+        }
+        style_guide = style_instructions.get(style, style_instructions['balanced'])
+
+        base_prompt = f"""You are {name}, interviewing for {role} at {company}.
+
+# Background
+{projects if projects else 'No specific background provided. Use [placeholder] for examples, projects, metrics.'}{strengths_text}
+
+# Style
+- Lead with specifics, show judgment, acknowledge tradeoffs
+- Use EXACT numbers from background — never round or simplify
+- No background? Use [placeholder] brackets. Never invent details.
+- Caught in error? Admit briefly, move on.
+
+# Answer Format
+- Yes/no → Under 10 words
+- Direct → PREP: Point, Reason, Example, Point (30-80 words)
+- Behavioral → STAR: Situation, Task, Action, Result (60-120 words)
+- Compound → Address each part (100-150 words)
+
+**Answer style: {style}**
+{style_guide}
+
+# Rules
+1. Answer the ACTUAL question — ignore irrelevant prepared Q&A
+2. Use ONLY relevant background/Q&A pairs
+3. Preserve exact metrics and context distinctions"""
+
+        # Append user's custom instructions if provided
+        if user_profile and user_profile.get('custom_instructions'):
+            custom_instructions = user_profile['custom_instructions'].strip()
+            if custom_instructions:
+                base_prompt += f"\n\n# YOUR SPECIFIC INTERVIEW CONTEXT & STYLE\n\n{custom_instructions}"
+
+        return base_prompt
+
+    async def generate_answer(
+        self,
+        question: str,
+        resume_text: str = "",
+        star_stories: list = None,
+        talking_points: list = None,
+        qa_pairs: list = None,
+        use_cache: bool = True,
+        user_profile: Optional[dict] = None,
+        session_history: list = None,
+        examples_used: list = None
+    ) -> tuple[str, list]:
+        """
+        Generate an interview answer based on question and user context.
+
+        Uses RAG (Retrieval Augmented Generation) approach:
+        1. Decompose complex questions into sub-questions
+        2. Find multiple relevant Q&A pairs (not just one)
+        3. Synthesize answer combining multiple prepared answers
+
+        Args:
+            question: The interview question detected
+            resume_text: User's resume content
+            star_stories: List of STAR stories
+            talking_points: List of key talking points
+            qa_pairs: List of prepared Q&A pairs
+            session_history: Previous Q&A from this session (to avoid repetition)
+            examples_used: Examples already used in this session (to avoid repetition)
+
+        Returns:
+            Tuple of (answer, examples_used_in_this_answer)
+        """
+        star_stories = star_stories or []
+        talking_points = talking_points or []
+        qa_pairs = qa_pairs or []
+
+        # Initialize session tracking
+        session_history = session_history or []
+        examples_used = examples_used or []
+
+        # RAG APPROACH: Find multiple relevant Q&A pairs for complex questions
+        # This handles compound questions like "Introduce yourself AND tell me why OpenAI"
+        user_id = user_profile.get('user_id') if user_profile else None  # FIX: Use 'user_id' not 'id'
+        relevant_qa_pairs = []
+
+        if user_id and self.qdrant_service:
+            relevant_qa_pairs = await self.find_relevant_qa_pairs(
+                question=question,
+                user_id=user_id,
+                max_total_results=5  # Get up to 5 relevant Q&A pairs
+            )
+
+            # DEBUG: Log what we got back
+            logger.warning(f"RAG_DEBUG: relevant_qa_pairs length: {len(relevant_qa_pairs)}")
+            if relevant_qa_pairs:
+                logger.warning(f"RAG_DEBUG: relevant_qa_pairs[0] similarity: {relevant_qa_pairs[0].get('similarity', 'NO_SIMILARITY_KEY')}")
+                logger.warning(f"RAG_DEBUG: relevant_qa_pairs[0] question: {relevant_qa_pairs[0].get('question', '')[:80]}")
+
+            # If we found a good match (>= 62% similarity), use the stored answer directly
+            # No need to generate a new answer when we already have a prepared one
+            if relevant_qa_pairs and relevant_qa_pairs[0].get('similarity', 0) >= 0.62:
+                best_match = relevant_qa_pairs[0]
+                similarity = best_match.get('similarity', 0)
+                logger.info(
+                    f"Using stored Q&A answer (similarity: {similarity:.1%}) for question: '{question}' "
+                    f"Matched: '{best_match.get('question', '')[:80]}...'"
+                )
+                return (best_match['answer'], [])
+
+        # Check cache if no good match found
+        if use_cache and not relevant_qa_pairs:
+            cached_answer = self._get_cached_answer(question, user_id)
+            if cached_answer:
+                return (cached_answer, [])  # Return tuple for consistency
+
+        logger.info(f"Generating RAG answer for question: '{question}'")
+        logger.info(f"Found {len(relevant_qa_pairs)} relevant Q&A pairs for synthesis")
+        logger.info(f"Context: resume={len(resume_text)} chars, stories={len(star_stories)}, points={len(talking_points)}, qa_pairs={len(qa_pairs)}")
+
+        # Build context
+        context_parts = []
+
+        if resume_text:
+            context_parts.append(f"RESUME:\n{resume_text}")
+
+        if star_stories:
+            stories_text = "\n\n".join([
+                f"Story: {s.get('title', 'Untitled')}\n"
+                f"Situation: {s.get('situation', '')}\n"
+                f"Task: {s.get('task', '')}\n"
+                f"Action: {s.get('action', '')}\n"
+                f"Result: {s.get('result', '')}"
+                for s in star_stories
+            ])
+            context_parts.append(f"STAR STORIES:\n{stories_text}")
+
+        if talking_points:
+            points_text = "\n".join([f"- {p.get('content', '')}" for p in talking_points])
+            context_parts.append(f"KEY TALKING POINTS:\n{points_text}")
+
+        # RAG: Add relevant Q&A pairs found via semantic search
+        if relevant_qa_pairs:
+            # Include top relevant Q&A pairs as context for synthesis
+            qa_text = "\n\n".join([
+                f"Q: {qa.get('question', '')}\n"
+                f"A: {qa.get('answer', '')}\n"
+                f"(Similarity: {qa.get('similarity', 0):.1%})"
+                for qa in relevant_qa_pairs[:5]  # Top 5 most relevant
+            ])
+            context_parts.append(f"RELEVANT PREPARED ANSWERS (use ONLY if directly relevant to the question — if none match, ignore them and answer from STAR stories/background instead):\n{qa_text}")
+
+        # Add session history (to avoid repeating same examples)
+        if session_history:
+            history_text = "\n\n".join([
+                f"{'Interviewer' if msg.get('role') == 'interviewer' else 'You'}: {msg.get('content', '')}"
+                for msg in session_history[-5:]  # Last 5 exchanges
+            ])
+            context_parts.append(f"SESSION HISTORY (previous questions/answers in this interview):\n{history_text}")
+
+        # Add examples already used (CRITICAL: avoid repetition)
+        if examples_used:
+            examples_text = "\n- ".join(examples_used)
+            context_parts.append(f"EXAMPLES ALREADY USED IN THIS SESSION (DO NOT REPEAT):\n- {examples_text}")
+
+        context = "\n\n---\n\n".join(context_parts) if context_parts else "No specific context provided."
+
+        system_prompt = self._get_system_prompt(user_profile)
+
+        # Detect question type and frustration level
+        context_info = self._detect_question_context(question)
+        qtype = context_info["type"]
+        frustrated = context_info["frustrated"]
+        max_tokens = context_info["max_tokens"]
+        instruction = context_info["instruction"]
+
+        # Add instruction about avoiding repetition if examples were used
+        repetition_warning = ""
+        if examples_used:
+            repetition_warning = f"\n\n🚨 CRITICAL: You have already used these examples/stories in this session:\n- {chr(10).join(['- ' + ex for ex in examples_used])}\n\nYou MUST use DIFFERENT examples or stories this time. DO NOT repeat the same examples."
+
+        # Add RAG synthesis instruction if we found multiple relevant Q&A pairs
+        rag_instruction = ""
+        if len(relevant_qa_pairs) > 1:
+            rag_instruction = f"\n\nNote: {len(relevant_qa_pairs)} relevant prepared answers provided above. Synthesize them into one cohesive response following the {instruction} guideline."
+
+        user_prompt = f"""CANDIDATE BACKGROUND:
+{context}
+
+INTERVIEW QUESTION:
+{question}
+{repetition_warning}
+{rag_instruction}
+
+Generate a suggested answer ({instruction}):"""
+
+        try:
+            logger.info(f"Sending request to Claude API (type: {qtype}, frustrated: {frustrated}, max_tokens: {max_tokens})")
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                system=[
+                    {
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": {"type": "ephemeral"}  # Enable prompt caching for 90% cost reduction
+                    }
+                ],
+                messages=[
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+
+            logger.warning(f"[Non-streaming] Requested: {self.model} | Actual: {response.model} | Usage: input={response.usage.input_tokens}, output={response.usage.output_tokens}")
+            answer = response.content[0].text
+            logger.info(f"Generated answer: {len(answer)} chars")
+
+            # Extract examples/projects mentioned in the answer (simple heuristic)
+            # Look for capitalized phrases that might be project/company names
+            new_examples = []
+            import re
+            # Match patterns like "Project X", "at Company Y", "working on Z"
+            example_patterns = re.findall(r'(?:Project|at|working on|led|built)\s+([A-Z][A-Za-z0-9\s]{2,30})', answer)
+            for match in example_patterns:
+                cleaned = match.strip()
+                if len(cleaned) > 3 and cleaned not in examples_used:
+                    new_examples.append(cleaned)
+
+            if new_examples:
+                logger.info(f"Extracted {len(new_examples)} new examples from answer: {new_examples}")
+
+            # Cache the answer for future use
+            if use_cache:
+                self._cache_answer(question, answer, user_id)
+
+            return (answer, new_examples)
+
+        except Exception as e:
+            logger.error(f"Claude API error: {str(e)}", exc_info=True)
+            return ("Error generating answer. Please try again.", [])
+
+    async def detect_question(self, transcription: str) -> dict:
+        """
+        Detect if the transcription contains an interview question.
+
+        Returns:
+            {
+                "is_question": bool,
+                "question": str (extracted question),
+                "question_type": str (behavioral/technical/situational)
+            }
+        """
+        logger.info(f"Detecting question in transcription: '{transcription}'")
+        
+        system_prompt = """Analyze the transcription and determine if it contains an interview question.
+Return your analysis in this exact format:
+IS_QUESTION: yes/no
+QUESTION: [the extracted question, or "none" if no question]
+TYPE: behavioral/technical/situational/general/none"""
+
+        try:
+            logger.info("Sending question detection request to Claude API")
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=256,
+                system=system_prompt,
+                messages=[
+                    {"role": "user", "content": f"Transcription: {transcription}"}
+                ]
+            )
+
+            result_text = response.content[0].text
+            logger.info(f"Question detection raw response: {result_text}")
+
+            # Parse response
+            lines = result_text.strip().split("\n")
+            is_question = False
+            question = ""
+            question_type = "none"
+
+            for line in lines:
+                if line.startswith("IS_QUESTION:"):
+                    is_question = "yes" in line.lower()
+                elif line.startswith("QUESTION:"):
+                    question = line.replace("QUESTION:", "").strip()
+                    if question.lower() == "none":
+                        question = ""
+                elif line.startswith("TYPE:"):
+                    question_type = line.replace("TYPE:", "").strip().lower()
+
+            result = {
+                "is_question": is_question,
+                "question": question,
+                "question_type": question_type
+            }
+            logger.info(f"Question detection result: {result}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Question detection error: {str(e)}", exc_info=True)
+            return {"is_question": False, "question": "", "question_type": "none"}
+
+
+    async def extract_qa_pairs_openai(self, text: str) -> list:
+        """
+        Extract Q&A pairs from free-form text using OpenAI Structured Outputs.
+
+        PRIMARY METHOD - Uses OpenAI's parse() with Pydantic schemas for 100% valid output.
+        Falls back to Claude Tool Use if OpenAI fails.
+
+        Args:
+            text: Free-form text containing questions and answers (any format)
+
+        Returns:
+            List of dicts with keys: question, answer, question_type, source
+        """
+        logger.info(f"Extracting Q&A pairs from text using OpenAI Structured Outputs ({len(text)} chars)")
+
+        try:
+            completion = await self.openai_client.beta.chat.completions.parse(
+                model="gpt-4o-2024-08-06",
+                messages=[
+                    {"role": "system", "content": "You are an expert at extracting interview Q&A pairs from text. Extract all question-answer pairs regardless of formatting (markdown, code blocks, tables, Q:/A: format, etc.)."},
+                    {"role": "user", "content": f"""Extract all interview Q&A pairs from the following text.
+
+The text may be in any format (markdown headers, code blocks, tables, Q:/A: format, etc.).
+
+Find every question-answer pair and return them in the structured format.
+
+Text to parse:
+
+{text}"""}
+                ],
+                response_format=QAPairList,
+            )
+
+            # Extract parsed data
+            parsed_data = completion.choices[0].message.parsed
+            if not parsed_data or not parsed_data.qa_pairs:
+                logger.warning("No Q&A pairs extracted by OpenAI")
+                return []
+
+            # Convert Pydantic models to dicts and add source field
+            qa_pairs = []
+            for pair in parsed_data.qa_pairs:
+                qa_pairs.append({
+                    "question": pair.question,
+                    "answer": pair.answer,
+                    "question_type": pair.question_type.lower(),
+                    "source": "bulk_upload"
+                })
+
+            logger.info(f"Successfully extracted {len(qa_pairs)} Q&A pairs using OpenAI Structured Outputs")
+            return qa_pairs
+
+        except Exception as e:
+            logger.error(f"OpenAI Q&A extraction error: {str(e)}", exc_info=True)
+            logger.warning("Falling back to Claude Tool Use")
+            return await self.extract_qa_pairs_claude(text)
+
+
+    async def extract_qa_pairs_claude(self, text: str) -> list:
+        """
+        Extract Q&A pairs from free-form text using Claude AI with Tool Use.
+
+        BACKUP METHOD - kept for fallback if OpenAI fails.
+
+        Uses Claude's Tool Use feature to guarantee valid JSON output,
+        similar to how I understand user intent in conversation.
+
+        Args:
+            text: Free-form text containing questions and answers (any format)
+
+        Returns:
+            List of dicts with keys: question, answer, question_type, source
+        """
+        logger.info(f"Extracting Q&A pairs from text ({len(text)} chars)")
+
+        # Define tool schema for structured extraction
+        tools = [{
+            "name": "save_qa_pairs",
+            "description": "Save extracted interview Q&A pairs. Use this to store all question-answer pairs you find in the text, regardless of formatting (markdown, code blocks, tables, etc.).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "qa_pairs": {
+                        "type": "array",
+                        "description": "Array of all Q&A pairs found in the text",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {
+                                    "type": "string",
+                                    "description": "The interview question (cleaned up, no Q: prefix, no markdown headers)"
+                                },
+                                "answer": {
+                                    "type": "string",
+                                    "description": "The corresponding answer (cleaned up, no A: prefix, no code block markers)"
+                                },
+                                "question_type": {
+                                    "type": "string",
+                                    "enum": ["behavioral", "technical", "situational", "general"],
+                                    "description": "Type of question: behavioral (tell me about, describe), technical (how does X work, explain), situational (what would you do), general (other)"
+                                }
+                            },
+                            "required": ["question", "answer", "question_type"]
+                        }
+                    }
+                },
+                "required": ["qa_pairs"]
+            }
+        }]
+
+        try:
+            logger.info("Sending Q&A extraction request with Tool Use")
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=8192,
+                tools=tools,
+                messages=[{
+                    "role": "user",
+                    "content": f"""Extract all interview Q&A pairs from the following text.
+
+The text may be in any format (markdown headers, code blocks, tables, Q:/A: format, etc.).
+
+Find every question-answer pair and use the save_qa_pairs tool to save them.
+
+Text to parse:
+
+{text}"""
+                }]
+            )
+
+            # Find tool use block in response
+            tool_use_block = None
+            for block in response.content:
+                if block.type == "tool_use" and block.name == "save_qa_pairs":
+                    tool_use_block = block
+                    break
+
+            if not tool_use_block:
+                logger.error("No tool_use block found in response")
+                logger.error(f"Response content: {response.content}")
+                return []
+
+            # Extract structured data from tool call
+            qa_pairs = tool_use_block.input.get("qa_pairs", [])
+
+            # Add source field
+            for pair in qa_pairs:
+                pair["source"] = "bulk_upload"
+
+            logger.info(f"Successfully extracted {len(qa_pairs)} Q&A pairs using Tool Use")
+            return qa_pairs
+
+        except Exception as e:
+            logger.error(f"Q&A extraction error: {str(e)}", exc_info=True)
+            logger.error(f"Full response: {response if 'response' in locals() else 'No response'}")
+            return []
+
+    async def find_matching_qa_pair(self, question: str, qa_pairs: list, user_id: Optional[str] = None) -> Optional[dict]:
+        """
+        Find a matching Q&A pair using PROPER semantic similarity with OpenAI Embeddings.
+
+        This replaces the old string-matching approach with real semantic similarity.
+
+        Performance:
+        - Uses cosine similarity on OpenAI embeddings (1536 dimensions)
+        - Checks both main question and question variations
+        - Falls back to string matching if embeddings unavailable
+
+        Args:
+            question: The detected interview question
+            qa_pairs: List of user's Q&A pairs (dicts with question, answer, etc.)
+            user_id: User ID for database-backed semantic search (optional)
+
+        Returns:
+            Matching Q&A pair dict if found (similarity >= 80%), None otherwise
+        """
+        if not qa_pairs:
+            return None
+
+        # Fallback to string-based matching (when Qdrant unavailable)
+        logger.warning("Using deprecated string matching - embeddings unavailable")
+        normalized_q = normalize_question(question)
+        threshold = 0.85
+
+        best_match = None
+        best_similarity = 0.0
+        matched_text = ""
+
+        for qa_pair in qa_pairs:
+            qa_question = qa_pair.get("question", "")
+            normalized_qa = normalize_question(qa_question)
+            similarity = calculate_similarity(normalized_q, normalized_qa)
+
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_match = qa_pair
+                matched_text = qa_question
+
+            variations = qa_pair.get("question_variations", [])
+            if variations:
+                for variation in variations:
+                    if variation and variation.strip():
+                        normalized_var = normalize_question(variation)
+                        var_similarity = calculate_similarity(normalized_q, normalized_var)
+
+                        if var_similarity > best_similarity:
+                            best_similarity = var_similarity
+                            best_match = qa_pair
+                            matched_text = variation
+
+        if best_similarity >= threshold:
+            logger.info(f"Found match (string-based, {best_similarity:.2%}): '{question}' ~ '{matched_text}'")
+            return best_match
+        else:
+            logger.info(f"No match found (best: {best_similarity:.2%})")
+            return None
+
+    def get_temporary_answer(self, question_type: str) -> str:
+        """
+        Get a type-specific temporary answer to show immediately while processing.
+
+        Args:
+            question_type: The type of question (behavioral/technical/situational/general)
+
+        Returns:
+            Temporary stalling text appropriate for the question type
+        """
+        temporary_answers = {
+            "behavioral": "For behavioral questions, I'd use the STAR method to structure my response. Let me think of a relevant example...",
+            "technical": "From a technical perspective, I'd approach this systematically. Give me a moment to organize my thoughts...",
+            "situational": "In that situation, I would first assess the priorities and stakeholders involved. Let me elaborate...",
+            "general": "That's a great question. Let me think about the best way to address this..."
+        }
+
+        return temporary_answers.get(question_type, temporary_answers["general"])
+
+
+# Singleton instance (will be initialized with supabase client)
+_claude_service: Optional[ClaudeService] = None
+
+def get_claude_service(supabase: Optional[Client] = None) -> ClaudeService:
+    """Get or create singleton Claude service instance"""
+    global _claude_service
+    if _claude_service is None:
+        # Initialize Qdrant service if configured (optional, graceful fallback)
+        qdrant_service = None
+        if settings.QDRANT_URL:
+            try:
+                from app.services.qdrant_service import QdrantService
+                qdrant_service = QdrantService(
+                    qdrant_url=settings.QDRANT_URL,
+                    openai_api_key=settings.OPENAI_API_KEY
+                )
+                logger.info("Initialized ClaudeService with Qdrant for vector search")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Qdrant (will use pgvector fallback): {e}")
+                qdrant_service = None
+
+        _claude_service = ClaudeService(supabase, qdrant_service)
+    return _claude_service

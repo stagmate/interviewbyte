@@ -1,0 +1,1104 @@
+"""
+WebSocket endpoint for real-time audio transcription with session memory
+"""
+
+import json
+import asyncio
+import logging
+import time
+from datetime import datetime
+import uuid
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from app.services.deepgram_service import deepgram_service
+from app.services.claude import get_claude_service, detect_question_fast
+from app.services.llm_service import llm_service
+from app.core.supabase import get_supabase_client, verify_access_token
+from app.services.statsig_service import (
+    get_variant,
+    log_session_started,
+    log_feedback_submitted,
+    log_session_completed,
+)
+from app.prompts.interview_prompts import get_prompt_for_variant
+
+# 로거 설정
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+# Helper functions for session management
+async def create_interview_session(user_id: str, title: str = "Interview Practice", profile_id: str = None) -> str:
+    """Create a new interview session and return session_id"""
+    try:
+        supabase = get_supabase_client()
+        data = {
+            "user_id": user_id,
+            "title": title,
+            "status": "active",
+            "started_at": datetime.utcnow().isoformat()
+        }
+
+        if profile_id:
+            data["profile_id"] = profile_id
+
+        result = supabase.table("interview_sessions").insert(data).execute()
+
+        if result.data:
+            session_id = result.data[0]["id"]
+            logger.info(f"Created interview session: {session_id} (profile: {profile_id})")
+            return session_id
+        return None
+    except Exception as e:
+        logger.error(f"Failed to create session: {e}")
+        return None
+
+
+async def save_session_message(
+    session_id: str,
+    role: str,
+    message_type: str,
+    content: str,
+    question_type: str = None,
+    source: str = None,
+    examples_used: list = None
+):
+    """Save a message to the interview session"""
+    try:
+        supabase = get_supabase_client()
+
+        # Get sequence number
+        count_result = supabase.table("session_messages").select(
+            "sequence_number", count="exact"
+        ).eq("session_id", session_id).execute()
+
+        sequence_number = (count_result.count or 0) + 1
+
+        data = {
+            "session_id": session_id,
+            "role": role,
+            "message_type": message_type,
+            "content": content,
+            "question_type": question_type,
+            "source": source,
+            "examples_used": examples_used or [],
+            "sequence_number": sequence_number,
+            "message_timestamp": datetime.utcnow().isoformat()
+        }
+
+        supabase.table("session_messages").insert(data).execute()
+        logger.debug(f"Saved session message ({role}/{message_type})")
+
+    except Exception as e:
+        logger.error(f"Failed to save session message: {e}")
+
+
+async def get_session_history(session_id: str) -> list:
+    """Get session history for context"""
+    try:
+        supabase = get_supabase_client()
+        result = supabase.rpc("get_session_history", {
+            "session_id_param": session_id
+        }).execute()
+
+        return result.data or []
+    except Exception as e:
+        logger.error(f"Failed to get session history: {e}")
+        return []
+
+
+async def get_session_examples(session_id: str) -> list:
+    """Get all examples used in session"""
+    try:
+        supabase = get_supabase_client()
+        result = supabase.rpc("get_session_examples", {
+            "session_id_param": session_id
+        }).execute()
+
+        return [row["example"] for row in (result.data or [])]
+    except Exception as e:
+        logger.error(f"Failed to get session examples: {e}")
+        return []
+
+
+async def end_interview_session(session_id: str):
+    """End interview session"""
+    try:
+        supabase = get_supabase_client()
+        supabase.rpc("end_interview_session", {
+            "session_id_param": session_id
+        }).execute()
+
+        logger.info(f"Ended interview session: {session_id}")
+    except Exception as e:
+        logger.error(f"Failed to end session: {e}")
+
+
+async def consume_interview_credit(user_id: str, session_id: str = None) -> dict:
+    """
+    Consume one interview credit when session ends.
+    Returns dict with success status and remaining credits.
+    """
+    try:
+        supabase = get_supabase_client()
+
+        # Call the database function to consume credit
+        result = supabase.rpc('consume_interview_credit', {
+            'p_user_id': user_id,
+            'p_session_id': session_id
+        }).execute()
+
+        success = result.data if result.data is not None else False
+
+        if success:
+            # Get remaining credits
+            credits_result = supabase.rpc('get_user_interview_credits', {
+                'p_user_id': user_id
+            }).execute()
+            remaining = credits_result.data if credits_result.data is not None else 0
+            logger.info(f"Consumed 1 credit for user {user_id}. Remaining: {remaining}")
+            return {"success": True, "remaining_credits": remaining}
+        else:
+            logger.warning(f"Failed to consume credit for user {user_id} - no credits available")
+            return {"success": False, "remaining_credits": 0}
+
+    except Exception as e:
+        logger.error(f"Failed to consume credit: {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def increment_qa_usage(qa_pair_id: str):
+    """Increment usage count for a Q&A pair when it's used in practice"""
+    try:
+        supabase = get_supabase_client()
+
+        # Fetch current usage count
+        result = supabase.table("qa_pairs").select("usage_count").eq("id", qa_pair_id).execute()
+
+        if not result.data:
+            logger.warning(f"Q&A pair {qa_pair_id} not found for usage increment")
+            return
+
+        current_count = result.data[0].get("usage_count", 0)
+        new_count = current_count + 1
+
+        # Update usage count and last_used_at
+        supabase.table("qa_pairs").update({
+            "usage_count": new_count,
+            "last_used_at": "now()"
+        }).eq("id", qa_pair_id).execute()
+
+        logger.info(f"Q&A pair {qa_pair_id} usage incremented: {current_count} → {new_count}")
+
+    except Exception as e:
+        logger.error(f"Failed to increment Q&A usage: {e}", exc_info=True)
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info(f"WebSocket connected. Total connections: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+            logger.info(f"WebSocket disconnected. Total connections: {len(self.active_connections)}")
+
+    async def send_json(self, websocket: WebSocket, data: dict) -> bool:
+        try:
+            await websocket.send_json(data)
+            logger.debug(f"Sent message: {data.get('type', 'unknown')}")
+            return True
+        except RuntimeError as e:
+            if "close message" in str(e) or "disconnect" in str(e).lower():
+                logger.info(f"Client disconnected while sending message: {data.get('type')}")
+                return False
+            logger.error(f"Error sending message: {str(e)}")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending message: {str(e)}")
+            return False
+
+
+manager = ConnectionManager()
+
+
+def is_likely_question(text: str) -> bool:
+    """
+    Quick pre-filter to check if text might be a question.
+    This is a fast keyword-based check to avoid unnecessary Claude API calls.
+
+    Args:
+        text: The transcribed text
+
+    Returns:
+        True if text might be a question, False if definitely not
+    """
+    if not text or len(text) < 5:
+        return False
+
+    text_lower = text.lower().strip()
+
+    # Question indicators
+    question_words = [
+        'what', 'how', 'why', 'when', 'where', 'who', 'which', 'whose',
+        'can you', 'could you', 'would you', 'will you', 'should you',
+        'do you', 'did you', 'does', 'have you', 'has',
+        'describe', 'tell me', 'explain', 'share', 'talk about',
+        'give me', 'walk me through', 'think of'
+    ]
+
+    # Check for question mark
+    if '?' in text:
+        return True
+
+    # Check if starts with question word
+    if any(text_lower.startswith(q) for q in question_words):
+        return True
+
+    # Check if contains question word
+    if any(f" {q} " in f" {text_lower} " for q in question_words):
+        return True
+
+    # If text is very short and has no question indicators, likely not a question
+    if len(text.split()) < 8:
+        return False
+
+    # For longer text without clear indicators, let Claude decide
+    return True
+
+
+def is_question_likely_complete(text: str) -> bool:
+    """
+    Check if a question appears to be complete.
+
+    Args:
+        text: The transcribed text
+
+    Returns:
+        True if the question appears complete, False otherwise
+    """
+    if not text:
+        return False
+
+    text = text.strip()
+    text_lower = text.lower()
+    word_count = len(text.split())
+
+    if word_count < 2:
+        return False
+
+    # Question mark with 2+ words is always complete
+    if text.endswith('?') and word_count >= 2:
+        return True
+
+    # Common short interview commands: "tell me about yourself.", "describe your experience."
+    short_command_starters = [
+        'tell me', 'describe', 'explain', 'share', 'walk me through',
+        'talk about', 'give me', 'how do you', 'why do you', 'what is',
+        'what are', 'what was', 'what were', 'how would you',
+    ]
+    if any(text_lower.startswith(s) for s in short_command_starters) and word_count >= 3:
+        return True
+
+    # Standard threshold for other text
+    if word_count < 5:
+        return False
+
+    # Terminal punctuation
+    if text.endswith('?') or text.endswith('.') or text.endswith('!'):
+        return True
+
+    # Long enough text is likely complete
+    if word_count >= 8:
+        return True
+
+    return False
+
+
+@router.websocket("/ws/transcribe")
+async def websocket_transcribe(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time audio transcription using Deepgram streaming.
+
+    Client sends:
+        - Binary audio data (WebM/Opus format chunks)
+        - JSON messages: {"type": "config", "language": "en"}
+
+    Server sends:
+        - {"type": "transcription", "text": "...", "is_final": bool}
+        - {"type": "question_detected", "question": "...", "question_type": "..."}
+        - {"type": "answer", "answer": "..."}
+        - {"type": "error", "message": "..."}
+    """
+    await manager.connect(websocket)
+
+    # Initialize Claude service with Qdrant support
+    claude_service = get_claude_service()
+
+    # Session state
+    language = "en"
+    user_id = None
+    profile_id = None  # For multi-profile support
+    user_profile = None  # Interview profile for personalized prompts
+    user_context = {
+        "resume_text": "",
+        "star_stories": [],
+        "talking_points": [],
+        "qa_pairs": []  # User's uploaded Q&A pairs
+    }
+    accumulated_text = ""
+    is_processing = False
+    audio_chunk_count = 0
+    total_audio_bytes = 0
+    last_processed_question = ""
+    deepgram_connected = False
+
+    # Generate unique connection ID for debugging
+    connection_id = str(uuid.uuid4())[:8]
+
+    # Session memory (NEW: track session for memory and export)
+    session_id = None
+    session_examples_used = []  # Track examples used to avoid repetition
+
+    # Statsig A/B test state
+    statsig_variant = None  # None = not yet assigned, will be set when user_id is known
+    session_turn_count = 0  # Track total Q&A turns for session_completed event
+    session_start_time = None  # Track session start for duration
+
+    logger.info(f"[{connection_id}] WebSocket transcription session started")
+
+    # Send immediate acknowledgment
+    try:
+        await manager.send_json(websocket, {
+            "type": "connected",
+            "message": "WebSocket connected successfully",
+            "connection_id": connection_id
+        })
+        logger.info(f"[{connection_id}] Sent connection acknowledgment to client")
+    except Exception as e:
+        logger.error(f"[{connection_id}] Failed to send connection ack: {e}")
+
+    # Deepgram transcript callback
+    async def on_transcript(text: str, is_final: bool):
+        nonlocal accumulated_text, is_processing, session_turn_count
+
+        try:
+            if not text.strip():
+                return
+
+            logger.info(f"[{connection_id}] Deepgram transcript ({'final' if is_final else 'interim'}): '{text}'")
+
+            # Update accumulated text
+            if is_final:
+                accumulated_text = text.strip()
+
+            # Send transcription to client
+            sent = await manager.send_json(websocket, {
+                "type": "transcription",
+                "text": text,
+                "accumulated_text": accumulated_text,
+                "is_final": is_final
+            })
+            if not sent:
+                return
+
+            # Save final transcripts to session for review
+            if is_final and session_id and accumulated_text:
+                try:
+                    await save_session_message(
+                        session_id=session_id,
+                        role="interviewer",
+                        message_type="transcription",
+                        content=accumulated_text,
+                        source="detected"
+                    )
+                except Exception as save_err:
+                    logger.warning(f"Failed to save transcription: {save_err}")
+
+            # Only process questions on final transcripts
+            if is_final and not is_processing:
+                is_processing = True
+
+                try:
+                    # Pre-filter: Quick check if this looks like a question
+                    if not is_likely_question(accumulated_text):
+                        logger.debug(f"Text does not appear to be a question: '{accumulated_text[:50]}...'")
+                        return
+
+                    # OPTIMIZATION (Phase 1.2): Fast pattern-based detection first
+                    # Only fall back to Claude API if confidence is low
+                    detection = detect_question_fast(accumulated_text)
+
+                    # Fallback: Use Claude API for low-confidence cases
+                    if detection["confidence"] == "low" and detection["is_question"]:
+                        logger.info("Low confidence pattern match, verifying with Claude API")
+                        detection = await claude_service.detect_question(accumulated_text)
+
+                    if detection["is_question"] and detection["question"]:
+                        # Validate question completeness
+                        if not is_question_likely_complete(detection["question"]):
+                            logger.info(f"Question incomplete: '{detection['question']}' - waiting")
+                            return
+
+                        question = detection["question"]
+                        question_type = detection["question_type"]
+
+                        logger.info(f"[{connection_id}] Complete question detected: '{question}' ({question_type})")
+
+                        # CRITICAL FIX: Guard against unauthenticated sessions (zombie connections)
+                        if not user_id:
+                            logger.warning(f"[{connection_id}] ⚠️ Ignoring question from unauthenticated session (no user_id set)")
+                            await manager.send_json(websocket, {
+                                "type": "error",
+                                "message": "Starting session... (please wait)",
+                                "code": "waiting_for_context"
+                            })
+                            return
+
+                        # NEW: Save question to session
+                        if session_id:
+                            await save_session_message(
+                                session_id=session_id,
+                                role="interviewer",
+                                message_type="question",
+                                content=question,
+                                question_type=question_type,
+                                source="detected"
+                            )
+
+                        await manager.send_json(websocket, {
+                            "type": "question_detected",
+                            "question": question,
+                            "question_type": question_type
+                        })
+
+                        # Auto-generate answer
+                        # Step 1: Check fast QA pair match first (same as manual path)
+                        matched_qa = claude_service.find_matching_qa_pair_fast(question, user_id)
+
+                        if matched_qa:
+                            # Fast path: return stored answer directly
+                            qa_pair_id = matched_qa.get("id")
+                            if qa_pair_id:
+                                asyncio.create_task(increment_qa_usage(qa_pair_id))
+                            logger.info(f"Auto-detect: Using uploaded Q&A pair (ID: {qa_pair_id})")
+
+                            await manager.send_json(websocket, {
+                                "type": "answer_stream_start",
+                                "question": question,
+                                "source": "uploaded"
+                            })
+                            await manager.send_json(websocket, {
+                                "type": "answer_stream_chunk",
+                                "question": question,
+                                "chunk": matched_qa["answer"],
+                                "source": "uploaded"
+                            })
+                            await manager.send_json(websocket, {
+                                "type": "answer_stream_end",
+                                "question": question,
+                                "source": "uploaded",
+                                "has_placeholder": False
+                            })
+
+                            if session_id:
+                                await save_session_message(
+                                    session_id=session_id,
+                                    role="candidate",
+                                    message_type="answer",
+                                    content=matched_qa["answer"],
+                                    question_type=question_type,
+                                    source="uploaded",
+                                    examples_used=[]
+                                )
+                        else:
+                            # RAG path: no fast match found, generate with LLM
+                            # 1. Send temporary answer immediately
+                            temp_answer = claude_service.get_temporary_answer(question_type)
+                            await manager.send_json(websocket, {
+                                "type": "answer_temporary",
+                                "question": question,
+                                "answer": temp_answer
+                            })
+
+                            # 2. Generate answer using RAG
+                            logger.info("No fast Q&A match, generating with RAG approach")
+
+                            # Run RAG search + session DB queries in PARALLEL
+                            rag_user_id = user_profile.get('user_id') if user_profile else None
+                            parallel_tasks = []
+                            task_keys = []
+
+                            if session_id:
+                                parallel_tasks.append(get_session_history(session_id))
+                                task_keys.append("history")
+                                parallel_tasks.append(get_session_examples(session_id))
+                                task_keys.append("examples")
+
+                            if rag_user_id and claude_service.qdrant_service:
+                                parallel_tasks.append(claude_service.find_relevant_qa_pairs(
+                                    question=question, user_id=rag_user_id, max_total_results=5
+                                ))
+                                task_keys.append("rag")
+
+                            if parallel_tasks:
+                                results = await asyncio.gather(*parallel_tasks)
+                                result_map = dict(zip(task_keys, results))
+                            else:
+                                result_map = {}
+
+                            session_history = result_map.get("history", [])
+                            session_examples = result_map.get("examples", [])
+                            pre_fetched_qa = result_map.get("rag", [])
+                            logger.info(f"Parallel fetch done: {len(session_history)} history, {len(session_examples)} examples, {len(pre_fetched_qa)} RAG results")
+
+                            # Inject A/B test prompt into user_profile custom_instructions
+                            if user_profile is not None:
+                                profile_with_variant = dict(user_profile)
+                                profile_with_variant["custom_instructions"] = (
+                                    get_prompt_for_variant(statsig_variant)
+                                    + "\n\n"
+                                    + (user_profile.get("custom_instructions") or "")
+                                ).strip()
+                            else:
+                                profile_with_variant = {
+                                    "custom_instructions": get_prompt_for_variant(statsig_variant)
+                                }
+
+                            # Signal streaming start
+                            await manager.send_json(websocket, {
+                                "type": "answer_stream_start",
+                                "question": question,
+                                "source": "generated"
+                            })
+
+                            # Stream answer chunks in real-time (RAG already done)
+                            generated_answer = ""
+                            async for chunk in llm_service.generate_answer_stream(
+                                question=question,
+                                resume_text=user_context["resume_text"],
+                                star_stories=user_context["star_stories"],
+                                talking_points=user_context["talking_points"],
+                                qa_pairs=user_context["qa_pairs"],
+                                format="bullet",
+                                user_profile=profile_with_variant,
+                                session_history=session_history,
+                                examples_used=session_examples,
+                                pre_fetched_qa_pairs=pre_fetched_qa
+                            ):
+                                generated_answer += chunk
+                                await manager.send_json(websocket, {
+                                    "type": "answer_stream_chunk",
+                                    "question": question,
+                                    "chunk": chunk,
+                                    "source": "generated"
+                                })
+
+                            # Extract examples and save generated answer to session
+                            if session_id and generated_answer:
+                                import re
+                                new_examples = []
+                                example_patterns = re.findall(
+                                    r'(?:Project|at|working on|led|built)\s+([A-Z][A-Za-z0-9\s]{2,30})',
+                                    generated_answer
+                                )
+                                for match in example_patterns:
+                                    cleaned = match.strip()
+                                    if len(cleaned) > 3 and cleaned not in session_examples:
+                                        new_examples.append(cleaned)
+
+                                logger.info(f"Extracted {len(new_examples)} new examples: {new_examples}")
+
+                                await save_session_message(
+                                    session_id=session_id,
+                                    role="candidate",
+                                    message_type="answer",
+                                    content=generated_answer,
+                                    question_type=question_type,
+                                    source="ai_generated",
+                                    examples_used=new_examples
+                                )
+
+                                # Update local tracking
+                                session_examples_used.extend(new_examples)
+
+                            # Detect if answer contains placeholders
+                            has_placeholder = '[' in generated_answer and ']' in generated_answer
+
+                            # Signal streaming end
+                            await manager.send_json(websocket, {
+                                "type": "answer_stream_end",
+                                "question": question,
+                                "source": "generated",
+                                "has_placeholder": has_placeholder
+                            })
+                            session_turn_count += 1
+                finally:
+                    is_processing = False
+
+        except Exception as e:
+            logger.error(f"Error in transcript callback: {e}", exc_info=True)
+
+    # Deepgram error callback
+    async def on_error(error: str):
+        logger.error(f"Deepgram error: {error}")
+
+        # Send error to client
+        await manager.send_json(websocket, {
+            "type": "error",
+            "message": f"Transcription error: {error}",
+            "fatal": error.startswith("FATAL:")  # Mark fatal errors
+        })
+
+        # Close WebSocket on fatal errors
+        if error.startswith("FATAL:"):
+            logger.error("Fatal Deepgram error detected, closing WebSocket connection")
+            try:
+                await websocket.close(code=1011, reason="Deepgram connection failed")
+            except Exception as e:
+                logger.error(f"Error closing WebSocket: {e}")
+
+    # Connect to Deepgram using context manager
+    try:
+        logger.info("Attempting to create Deepgram connection...")
+        async with deepgram_service.create_connection(
+            on_transcript=on_transcript,
+            on_error=on_error
+        ) as dg_connection:
+            logger.info("Deepgram connection created, setting up handlers...")
+            # Set up event handlers and start listening
+            await deepgram_service.setup_connection(dg_connection)
+            deepgram_connected = True
+            logger.info("✓ Deepgram connected and ready")
+
+            # Notify client that transcription is ready
+            await manager.send_json(websocket, {
+                "type": "transcription_ready",
+                "message": "Speech recognition ready"
+            })
+
+            # Main message loop
+            while True:
+                try:
+                    message = await websocket.receive()
+                except RuntimeError as e:
+                    err_msg = str(e).lower()
+                    if "disconnect" in err_msg or "close message" in err_msg:
+                        logger.info("WebSocket disconnected during receive")
+                        break
+                    logger.error(f"WebSocket receive error: {e}")
+                    break
+                except Exception as e:
+                    logger.error(f"Unexpected WebSocket error: {e}")
+                    break
+
+                if "bytes" in message:
+                    # Audio data received - send immediately to Deepgram
+                    audio_chunk_count += 1
+                    chunk_size = len(message["bytes"])
+                    total_audio_bytes += chunk_size
+
+                    logger.debug(f"Audio chunk #{audio_chunk_count}: {chunk_size} bytes (total: {total_audio_bytes} bytes)")
+
+                    # Send audio chunk immediately to Deepgram for real-time transcription
+                    if deepgram_connected:
+                        success = await deepgram_service.send_audio(message["bytes"])
+                        if not success:
+                            logger.warning(f"Failed to send audio chunk #{audio_chunk_count} to Deepgram")
+                    else:
+                        logger.warning("Deepgram not connected, skipping audio chunk")
+
+                elif "text" in message:
+                    # JSON message received
+                    try:
+                        data = json.loads(message["text"])
+                        msg_type = data.get("type", "")
+                        logger.info(f"Received JSON message: {msg_type}")
+
+                        if msg_type == "config":
+                            language = data.get("language", "en")
+                            logger.info(f"Language configured to: {language}")
+                            await manager.send_json(websocket, {
+                                "type": "config_ack",
+                                "language": language
+                            })
+
+                        elif msg_type == "context":
+                            logger.error(f"DEBUG: context handler reached")
+                            # Update user context
+                            user_context["resume_text"] = data.get("resume_text", "")
+                            user_context["star_stories"] = data.get("star_stories", [])
+                            user_context["talking_points"] = data.get("talking_points", [])
+                            user_context["qa_pairs"] = data.get("qa_pairs", [])
+
+                            # Verify JWT token to authenticate user
+                            access_token = data.get("access_token")
+                            received_profile_id = data.get("profile_id")
+
+                            if access_token:
+                                verified_user_id = await verify_access_token(access_token)
+                                if verified_user_id:
+                                    received_user_id = verified_user_id
+                                    logger.info(f"[{connection_id}] JWT verified: user_id={verified_user_id}")
+                                else:
+                                    logger.warning(f"[{connection_id}] Invalid JWT token provided")
+                                    await manager.send_json(websocket, {
+                                        "type": "error",
+                                        "message": "Authentication failed. Please log in again.",
+                                        "code": "auth_failed"
+                                    })
+                                    continue
+                            else:
+                                # Fallback for backward compatibility during deployment transition
+                                received_user_id = data.get("user_id")
+                                if received_user_id:
+                                    logger.warning(f"[{connection_id}] No JWT token provided, using client user_id (DEPRECATED)")
+
+                            logger.info(f"[{connection_id}] Context received: user_id={received_user_id}, profile_id={received_profile_id}")
+
+                            # Check if user or profile changed
+                            user_changed = received_user_id and received_user_id != user_id
+                            profile_changed = received_profile_id and received_profile_id != profile_id
+
+                            if user_changed or profile_changed:
+                                if user_changed:
+                                    logger.info(f"[{connection_id}] User authenticated: {received_user_id}")
+                                    user_id = received_user_id
+                                if received_profile_id:
+                                    profile_id = received_profile_id
+                                    logger.warning(f"CONTEXT_DEBUG: Switching profile_id to {profile_id}")
+
+                                # Load interview profile (specific profile if profile_id provided, otherwise default)
+                                try:
+                                    supabase = get_supabase_client()
+
+                                    if profile_id:
+                                        # Load specific profile by ID
+                                        profile_response = supabase.table("user_interview_profiles") \
+                                            .select("*") \
+                                            .eq("id", profile_id) \
+                                            .eq("user_id", user_id) \
+                                            .execute()
+                                    else:
+                                        # Load default profile or any profile
+                                        profile_response = supabase.table("user_interview_profiles") \
+                                            .select("*") \
+                                            .eq("user_id", user_id) \
+                                            .eq("is_default", True) \
+                                            .execute()
+
+                                        # If no default, get any profile
+                                        if not profile_response.data or len(profile_response.data) == 0:
+                                            profile_response = supabase.table("user_interview_profiles") \
+                                                .select("*") \
+                                                .eq("user_id", user_id) \
+                                                .limit(1) \
+                                                .execute()
+
+                                    if profile_response.data and len(profile_response.data) > 0:
+                                        user_profile = profile_response.data[0]
+                                        profile_id = user_profile.get("id")  # Ensure profile_id is set
+                                        logger.info(f"Loaded interview profile for user {user_id}: {user_profile.get('profile_name', 'N/A')} ({user_profile.get('full_name', 'N/A')})")
+                                    else:
+                                        logger.info(f"No interview profile found for user {user_id}, using defaults")
+                                        user_profile = None
+                                except Exception as e:
+                                    logger.error(f"Failed to load interview profile: {e}", exc_info=True)
+                                    user_profile = None
+
+                                # NEW: Create interview session for memory tracking (with profile_id)
+                                if not session_id:
+                                    session_id = await create_interview_session(user_id, "Interview Practice", profile_id)
+                                    if session_id:
+                                        logger.info(f"Created session {session_id} for user {user_id}, profile {profile_id}")
+
+                                # Assign Statsig variant for this session
+                                if user_id and statsig_variant is None:
+                                    logger.error(f"DEBUG: about to call statsig for user_id={user_id}")
+                                    statsig_variant = get_variant(user_id)
+                                    logger.info(f"DEBUG: statsig variant = {statsig_variant}")
+                                    log_session_started(user_id, statsig_variant)
+                                    logger.info(f"Statsig variant assigned: {statsig_variant} for user {user_id}")
+                                    session_start_time = time.time()
+
+                            # OPTIMIZATION (Phase 1.1): Build Q&A index for fast lookup
+                            # This takes <1ms and enables O(1) exact matching + faster similarity search
+                            claude_service.build_qa_index(user_context["qa_pairs"], user_id)
+
+                            logger.info(
+                                f"Context updated: {len(user_context['star_stories'])} stories, "
+                                f"{len(user_context['talking_points'])} points, "
+                                f"{len(user_context['qa_pairs'])} Q&A pairs"
+                            )
+                            await manager.send_json(websocket, {
+                                "type": "context_ack",
+                                "message": "Context updated",
+                                "has_profile": user_profile is not None
+                            })
+                            logger.info(f"[{connection_id}] Context acknowledged for user {user_id}")
+
+                        elif msg_type == "clear":
+                            # Log session completion to Statsig before clearing
+                            if session_id and user_id and session_start_time:
+                                duration = int(time.time() - session_start_time)
+                                log_session_completed(user_id, statsig_variant, duration, session_turn_count)
+                                session_start_time = None  # Prevent double logging
+
+                            # NEW: End current session before clearing
+                            if session_id:
+                                await end_interview_session(session_id)
+                                session_id = None
+                                session_examples_used = []
+
+                            # Clear accumulated text, answer cache, and Q&A index
+                            accumulated_text = ""
+                            audio_chunk_count = 0
+                            total_audio_bytes = 0
+                            last_processed_question = ""
+                            user_context["qa_pairs"] = []
+                            claude_service.clear_cache()
+                            claude_service.build_qa_index([], user_id)  # Clear Q&A index
+                            logger.info("Session cleared, including answer cache and Q&A index")
+                            await manager.send_json(websocket, {
+                                "type": "cleared",
+                                "message": "Session cleared"
+                            })
+
+                        elif msg_type == "start_recording":
+                            # Wait for user_id if not yet set (race condition with context message)
+                            if not user_id:
+                                logger.info("start_recording received before user_id set, waiting up to 2s...")
+                                for _ in range(20):  # 20 x 100ms = 2s max
+                                    await asyncio.sleep(0.1)
+                                    if user_id:
+                                        break
+
+                            # Consume credit when recording starts
+                            if user_id:
+                                credit_result = await consume_interview_credit(user_id, session_id)
+                                if credit_result.get("success"):
+                                    logger.info(f"Credit consumed on recording start. Remaining: {credit_result.get('remaining_credits')}")
+                                    await manager.send_json(websocket, {
+                                        "type": "credit_consumed",
+                                        "remaining_credits": credit_result.get("remaining_credits"),
+                                        "message": "Credit consumed"
+                                    })
+                                else:
+                                    logger.warning(f"Failed to consume credit for user {user_id}")
+                                    await manager.send_json(websocket, {
+                                        "type": "no_credits",
+                                        "message": "No interview credits available"
+                                    })
+                            else:
+                                logger.warning("start_recording received but no user_id set after 2s wait")
+
+                        elif msg_type == "generate_answer":
+                            # Manual answer generation request
+                            question = data.get("question", "")
+                            question_type = data.get("question_type", "general")
+
+                            if question:
+                                logger.info(f"Manual answer generation for: '{question}' (type: {question_type})")
+
+                                # 1. Send temporary answer immediately
+                                temp_answer = claude_service.get_temporary_answer(question_type)
+                                await manager.send_json(websocket, {
+                                    "type": "answer_temporary",
+                                    "question": question,
+                                    "answer": temp_answer
+                                })
+
+                                # 2. Check for uploaded Q&A match (OPTIMIZED: <1ms lookup)
+                                matched_qa = claude_service.find_matching_qa_pair_fast(question, user_id)
+
+                                if matched_qa:
+                                    # 3a. Return uploaded answer (instant)
+                                    qa_pair_id = matched_qa.get("id")
+
+                                    # Increment usage count in background
+                                    if qa_pair_id:
+                                        asyncio.create_task(increment_qa_usage(qa_pair_id))
+                                    logger.info(f"Using uploaded Q&A pair (ID: {matched_qa.get('id')})")
+                                    await manager.send_json(websocket, {
+                                        "type": "answer",
+                                        "question": question,
+                                        "answer": matched_qa["answer"],
+                                        "source": "uploaded",
+                                        "qa_pair_id": matched_qa.get("id"),
+                                        "is_streaming": False
+                                    })
+                                else:
+                                    # 3b. Generate with streaming LLM (Phase 1.3)
+                                    logger.info("No matching Q&A found, generating with streaming LLM")
+
+                                    # Run RAG search + session DB queries in PARALLEL
+                                    manual_parallel_tasks = []
+                                    manual_task_keys = []
+
+                                    if session_id:
+                                        manual_parallel_tasks.append(get_session_history(session_id))
+                                        manual_task_keys.append("history")
+                                        manual_parallel_tasks.append(get_session_examples(session_id))
+                                        manual_task_keys.append("examples")
+
+                                    manual_rag_user_id = user_profile.get('user_id') if user_profile else None
+                                    if manual_rag_user_id and claude_service.qdrant_service:
+                                        manual_parallel_tasks.append(claude_service.find_relevant_qa_pairs(
+                                            question=question,
+                                            user_id=manual_rag_user_id,
+                                            max_total_results=5
+                                        ))
+                                        manual_task_keys.append("rag")
+
+                                    manual_result_map = {}
+                                    if manual_parallel_tasks:
+                                        manual_results = await asyncio.gather(*manual_parallel_tasks)
+                                        manual_result_map = dict(zip(manual_task_keys, manual_results))
+
+                                    session_history = manual_result_map.get("history", [])
+                                    session_examples = manual_result_map.get("examples", [])
+                                    manual_pre_fetched_qa = manual_result_map.get("rag")
+
+                                    # Inject A/B test prompt into user_profile custom_instructions
+                                    if user_profile is not None:
+                                        manual_profile_with_variant = dict(user_profile)
+                                        manual_profile_with_variant["custom_instructions"] = (
+                                            get_prompt_for_variant(statsig_variant)
+                                            + "\n\n"
+                                            + (user_profile.get("custom_instructions") or "")
+                                        ).strip()
+                                    else:
+                                        manual_profile_with_variant = {
+                                            "custom_instructions": get_prompt_for_variant(statsig_variant)
+                                        }
+
+                                    # Signal streaming start
+                                    await manager.send_json(websocket, {
+                                        "type": "answer_stream_start",
+                                        "question": question,
+                                        "source": "generated"
+                                    })
+
+                                    # Stream answer chunks in real-time (RAG already done)
+                                    generated_answer = ""
+                                    async for chunk in llm_service.generate_answer_stream(
+                                        question=question,
+                                        resume_text=user_context["resume_text"],
+                                        star_stories=user_context["star_stories"],
+                                        talking_points=user_context["talking_points"],
+                                        qa_pairs=user_context["qa_pairs"],
+                                        format="bullet",
+                                        user_profile=manual_profile_with_variant,
+                                        session_history=session_history,
+                                        examples_used=session_examples,
+                                        pre_fetched_qa_pairs=manual_pre_fetched_qa
+                                    ):
+                                        generated_answer += chunk
+                                        await manager.send_json(websocket, {
+                                            "type": "answer_stream_chunk",
+                                            "question": question,
+                                            "chunk": chunk,
+                                            "source": "generated"
+                                        })
+
+                                    # NEW: Save answer with extracted examples
+                                    if session_id and generated_answer:
+                                        import re
+                                        new_examples = []
+                                        example_patterns = re.findall(
+                                            r'(?:Project|at|working on|led|built)\s+([A-Z][A-Za-z0-9\s]{2,30})',
+                                            generated_answer
+                                        )
+                                        for match in example_patterns:
+                                            cleaned = match.strip()
+                                            if len(cleaned) > 3 and cleaned not in session_examples:
+                                                new_examples.append(cleaned)
+
+                                        await save_session_message(
+                                            session_id=session_id,
+                                            role="candidate",
+                                            message_type="answer",
+                                            content=generated_answer,
+                                            question_type=question_type,
+                                            source="ai_generated",
+                                            examples_used=new_examples
+                                        )
+                                        session_examples_used.extend(new_examples)
+
+                                    # Detect if answer contains placeholders
+                                    has_placeholder = '[' in generated_answer and ']' in generated_answer
+
+                                    # Signal streaming end
+                                    await manager.send_json(websocket, {
+                                        "type": "answer_stream_end",
+                                        "question": question,
+                                        "source": "generated",
+                                        "has_placeholder": has_placeholder
+                                    })
+                                    session_turn_count += 1
+
+                        elif msg_type == "feedback":
+                            # Handle thumbs up/down from user
+                            rating = data.get("rating")  # 1 or -1
+                            if user_id and session_id and rating in (1, -1):
+                                log_feedback_submitted(user_id, statsig_variant, rating, session_id)
+                                logger.info(f"Feedback logged: rating={rating}, variant={statsig_variant}")
+                            await manager.send_json(websocket, {"type": "feedback_ack"})
+
+                        elif msg_type == "finalize":
+                            # Signal end of audio stream to Deepgram
+                            if deepgram_connected:
+                                logger.info("Finalizing Deepgram stream")
+                                await deepgram_service.finish()
+                                await manager.send_json(websocket, {
+                                    "type": "finalized",
+                                    "message": "Audio stream finalized"
+                                })
+
+                    except json.JSONDecodeError as e:
+                        logger.error(f"JSON decode error: {str(e)}")
+                        await manager.send_json(websocket, {
+                            "type": "error",
+                            "message": "Invalid JSON message"
+                        })
+
+    except WebSocketDisconnect:
+        logger.info(f"[{connection_id}] WebSocket disconnected after {audio_chunk_count} chunks, {total_audio_bytes} total bytes")
+    except asyncio.TimeoutError:
+        logger.error(f"[{connection_id}] TIMEOUT: Deepgram connection timed out", exc_info=True)
+        try:
+            await manager.send_json(websocket, {
+                "type": "error",
+                "message": "Connection timeout - please refresh and try again"
+            })
+        except:
+            pass
+    except Exception as e:
+        logger.error(f"WebSocket error: {type(e).__name__}: {str(e)}", exc_info=True)
+        try:
+            await manager.send_json(websocket, {
+                "type": "error",
+                "message": f"Connection error: {str(e)}"
+            })
+        except:
+            pass
+    finally:
+        # Log session completion to Statsig on disconnect
+        if session_id and user_id and session_start_time:
+            duration = int(time.time() - session_start_time)
+            log_session_completed(user_id, statsig_variant, duration, session_turn_count)
+            session_start_time = None  # Prevent double logging
+
+        # End session on disconnect (credit already consumed at start)
+        if session_id:
+            await end_interview_session(session_id)
+            logger.info(f"[{connection_id}] Ended session {session_id} on disconnect")
+
+        # Deepgram connection is automatically closed by context manager
+        manager.disconnect(websocket)
+        logger.info(f"[{connection_id}] WebSocket session ended")
